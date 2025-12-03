@@ -1,0 +1,33 @@
+# DiT-XL/2 ImageNet 256x256 Configuration
+
+data:
+  # 请修改为实际的 ImageNet 路径
+  data_path: "/work/c30636/dataset/imagenet/"
+  image_size: 256
+  num_workers: 4
+
+model:
+  # DiT-XL/2 Config
+  input_size: 32      # 256 / 8 (VAE downsample factor)
+  patch_size: 2
+  in_channels: 4
+  hidden_size: 1152
+  depth: 28
+  num_heads: 16
+  learn_sigma: True
+  num_classes: 1000
+
+diffusion:
+  num_timesteps: 1000
+  beta_start: 0.0001
+  beta_end: 0.02
+
+training:
+  epochs: 100
+  batch_size: 32      # Per GPU batch size
+  lr: 0.0001          # 1e-4
+  results_dir: "./results/dit_xl_2"
+  use_amp: True       # 使用 BF16/FP16 混合精度
+  seed: 42
+  log_interval: 100
+  save_interval: 1    # Epochs
