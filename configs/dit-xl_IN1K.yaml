@@ -24,7 +24,7 @@ diffusion:
 
 training:
   epochs: 100
-  batch_size: 128      # Per GPU batch size
+  batch_size: 64      # Per GPU batch size
   lr: 0.0001          # 1e-4
   results_dir: "./results/dit_xl_2"
   use_amp: True       # 使用 BF16/FP16 混合精度
