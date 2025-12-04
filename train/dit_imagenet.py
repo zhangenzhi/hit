@@ -50,10 +50,11 @@ class Trainer:
         labels = torch.randint(0, 1000, (n_samples,), device=self.device)
         
         # 获取 latent 尺寸 (C, H, W)
-        if isinstance(self.model, DDP):
-            latent_size = (self.model.module.in_channels, self.model.module.input_size, self.model.module.input_size)
-        else:
-            latent_size = (self.model.in_channels, self.model.input_size, self.model.input_size)
+        # 修改：从 config 获取参数，因为模型实例可能未保存这些属性
+        # flat_config 中包含了 model.in_channels 和 model.input_size
+        in_channels = getattr(self.config, 'in_channels', 4)
+        input_size = getattr(self.config, 'input_size', 32)
+        latent_size = (in_channels, input_size, input_size)
 
         # 1. 扩散模型采样 Latent
         # 假设 diffusion.sample 实现了 DDIM/DDPM 采样循环
@@ -99,10 +100,10 @@ class Trainer:
             n_samples = self.config.batch_size
             labels = torch.randint(0, 1000, (n_samples,), device=self.device)
             
-            if isinstance(self.model, DDP):
-                latent_size = (self.model.module.in_channels, self.model.module.input_size, self.model.module.input_size)
-            else:
-                latent_size = (self.model.in_channels, self.model.input_size, self.model.input_size)
+            # 这里也同样修改为从 config 获取 latent_size
+            in_channels = getattr(self.config, 'in_channels', 4)
+            input_size = getattr(self.config, 'input_size', 32)
+            latent_size = (in_channels, input_size, input_size)
             
             z = self.diffusion.sample(self.model, n_samples, labels, latent_size)
             fake_imgs = self.vae.decode(z / 0.18215).sample
@@ -161,8 +162,8 @@ class Trainer:
                 self.visualize(epoch)
             
             # FID 计算通常比较慢，建议频率低一点，例如每 5 个 epoch
-            if epoch > 0 and epoch % 5 == 0:
-                self.evaluate_fid(epoch)
+            # if epoch > 0 and epoch % 5 == 0:
+            #     self.evaluate_fid(epoch)
                 
     def save_checkpoint(self, epoch):
         if self.config.local_rank == 0:
