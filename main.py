@@ -7,13 +7,6 @@ import torch.distributed as dist
 from diffusers.models import AutoencoderKL
 from types import SimpleNamespace
 
-# 导入你的模块
-from model.dit import DiT
-from diffusion.ddim import GaussianDiffusion
-from train.dit_imagenet import DiTImangenetTrainer
-# 关键：导入你提供的 dataloader 构建函数
-from dataset.dit_imagenet import build_dit_dataloaders
-
 # -----------------------------------------------------------------------------
 # 1. 路径设置: 将项目根目录添加到 sys.path 以便导入模块
 # -----------------------------------------------------------------------------
@@ -21,7 +14,10 @@ current_dir = os.path.dirname(os.path.abspath(__file__))
 root_dir = os.path.dirname(current_dir)
 sys.path.append(root_dir)
 
-
+from model.dit import DiT
+from diffusion.gaussian_diffusion import GaussianDiffusion
+from train.dit_imagenet import Trainer
+from dataset.dit_imagenet import build_dit_dataloaders
 
 def dict_to_namespace(d):
     """
@@ -58,6 +54,7 @@ def cleanup():
 
 def main():
     parser = argparse.ArgumentParser(description="Train DiT on ImageNet")
+    # 修正：保持与实际创建的配置文件名一致
     parser.add_argument("--config", type=str, default="./configs/dit-b_IN1K.yaml", help="Path to config yaml")
     parser.add_argument("--local-rank", type=int, default=int(os.environ.get("LOCAL_RANK", 0)), help="Local rank for DDP")
     
@@ -85,10 +82,7 @@ def main():
     config.use_ddp = True # 默认开启 DDP 逻辑
 
     # 3. 初始化分布式环境
-    try:
-        # 检查是否已经初始化 (防止重复初始化)
-        dist.get_world_size()
-    except RuntimeError:
+    if not dist.is_initialized():
         # 如果是 torchrun 启动，env 变量已设置
         if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
             dist.init_process_group("nccl")
@@ -153,7 +147,7 @@ def main():
     if flat_config.local_rank == 0:
         print("Start Training...")
         
-    trainer = DiTImangenetTrainer(model, diffusion, vae, train_loader, flat_config)
+    trainer = Trainer(model, diffusion, vae, train_loader, flat_config)
     
     for epoch in range(flat_config.epochs):
         if config.use_ddp:

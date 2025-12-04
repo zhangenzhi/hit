@@ -6,7 +6,7 @@ from torch.utils.data.distributed import DistributedSampler
 import os
 from time import time
 
-class DiTImangenetTrainer:
+class Trainer:
     """
     负责训练循环、混合精度、分布式、日志
     """
