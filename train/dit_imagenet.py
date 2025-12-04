@@ -39,6 +39,44 @@ class Trainer:
                 print("Warning: torchmetrics not found. FID evaluation will be skipped.")
 
     @torch.no_grad()
+    def sample_ddpm(self, n, labels, size):
+        """
+        在 Trainer 内部实现的简单 DDPM 采样循环
+        解决 AttributeError: 'GaussianDiffusion' object has no attribute 'sample'
+        """
+        self.model.eval()
+        x = torch.randn(n, *size).to(self.device)
+        
+        for i in reversed(range(self.diffusion.num_timesteps)):
+            t = torch.full((n,), i, device=self.device, dtype=torch.long)
+            
+            # 1. 预测噪声
+            model_output = self.model(x, t, labels)
+            # 如果模型输出包含方差 (2*C)，只取前半部分作为噪声预测
+            if model_output.shape[1] == 2 * x.shape[1]:
+                model_output, _ = model_output.chunk(2, dim=1)
+            
+            # 2. 获取当前时间步的参数
+            beta = self.diffusion.betas[i]
+            alpha = self.diffusion.alphas[i]
+            # alpha_cumprod = self.diffusion.alphas_cumprod[i]
+            sqrt_one_minus_alpha_cumprod = self.diffusion.sqrt_one_minus_alphas_cumprod[i]
+            
+            # 3. 计算均值: 1/sqrt(alpha) * (x - beta/sqrt(1-alpha_bar) * eps)
+            coeff = beta / sqrt_one_minus_alpha_cumprod
+            mean = (1 / torch.sqrt(alpha)) * (x - coeff * model_output)
+            
+            # 4. 加噪声 (t > 0)
+            if i > 0:
+                noise = torch.randn_like(x)
+                sigma = torch.sqrt(beta) # 简单的 sigma = sqrt(beta)
+                x = mean + sigma * noise
+            else:
+                x = mean
+                
+        return x
+
+    @torch.no_grad()
     def visualize(self, epoch):
         """
         生成采样图片进行可视化验证
@@ -57,8 +95,8 @@ class Trainer:
         latent_size = (in_channels, input_size, input_size)
 
         # 1. 扩散模型采样 Latent
-        # 假设 diffusion.sample 实现了 DDIM/DDPM 采样循环
-        z = self.diffusion.sample(self.model, n_samples, labels, latent_size)
+        # 修改：使用内部实现的 sample_ddpm 替代 self.diffusion.sample
+        z = self.sample_ddpm(n_samples, labels, latent_size)
         
         # 2. VAE 解码: Latent -> Pixel
         # 注意: SD VAE 训练时乘了 0.18215，解码时需要除回去
@@ -105,7 +143,8 @@ class Trainer:
             input_size = getattr(self.config, 'input_size', 32)
             latent_size = (in_channels, input_size, input_size)
             
-            z = self.diffusion.sample(self.model, n_samples, labels, latent_size)
+            # 修改：使用内部实现的 sample_ddpm
+            z = self.sample_ddpm(n_samples, labels, latent_size)
             fake_imgs = self.vae.decode(z / 0.18215).sample
             fake_imgs_uint8 = ((fake_imgs + 1) * 127.5).clamp(0, 255).to(torch.uint8)
             self.fid_metric.update(fake_imgs_uint8, real=False)
@@ -162,8 +201,8 @@ class Trainer:
                 self.visualize(epoch)
             
             # FID 计算通常比较慢，建议频率低一点，例如每 5 个 epoch
-            # if epoch > 0 and epoch % 5 == 0:
-            #     self.evaluate_fid(epoch)
+            if epoch > 0 and epoch % 5 == 0:
+                self.evaluate_fid(epoch)
                 
     def save_checkpoint(self, epoch):
         if self.config.local_rank == 0:
