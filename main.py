@@ -6,7 +6,13 @@ import torch
 import torch.distributed as dist
 from diffusers.models import AutoencoderKL
 from types import SimpleNamespace
-import re # [新增] 用于解析文件名中的 epoch
+
+# 导入你的模块
+from model.dit import DiT
+from diffusion.ddim import GaussianDiffusion
+from train.dit_imagenet import DiTImangenetTrainer
+# 关键：导入你提供的 dataloader 构建函数
+from dataset.dit_imagenet import build_dit_dataloaders
 
 # -----------------------------------------------------------------------------
 # 1. 路径设置: 将项目根目录添加到 sys.path 以便导入模块
@@ -14,11 +20,6 @@ import re # [新增] 用于解析文件名中的 epoch
 current_dir = os.path.dirname(os.path.abspath(__file__))
 root_dir = os.path.dirname(current_dir)
 sys.path.append(root_dir)
-
-from model.dit import DiT
-from diffusion.gaussian_diffusion import GaussianDiffusion
-from train.dit_imagenet import Trainer
-from dataset.dit_imagenet import build_dit_dataloaders
 
 def dict_to_namespace(d):
     """
@@ -55,16 +56,14 @@ def cleanup():
 
 def main():
     parser = argparse.ArgumentParser(description="Train DiT on ImageNet")
-    # 修正：保持与实际创建的配置文件名一致
-    parser.add_argument("--config", type=str, default="./configs/dit-xl_IN1K.yaml", help="Path to config yaml")
+    parser.add_argument("--config", type=str, default="./configs/dit-b_IN1K.yaml", help="Path to config yaml")
     parser.add_argument("--local-rank", type=int, default=int(os.environ.get("LOCAL_RANK", 0)), help="Local rank for DDP")
     
     # 允许命令行覆盖关键参数
     parser.add_argument("--data_path", type=str, default=None, help="Override data path")
     parser.add_argument("--results_dir", type=str, default=None, help="Override results dir")
-    
-    # [新增] Resume 参数
-    parser.add_argument("--resume", type=str, default="", help="Path to checkpoint to resume from (e.g. results/checkpoint_050.pt)")
+    # 新增 resume 参数
+    parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume from")
     
     args = parser.parse_args()
 
@@ -86,6 +85,7 @@ def main():
     config.use_ddp = True # 默认开启 DDP 逻辑
 
     # 3. 初始化分布式环境
+    # 修改点：使用 is_initialized() 替代 try-except，更稳健
     if not dist.is_initialized():
         # 如果是 torchrun 启动，env 变量已设置
         if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
@@ -98,6 +98,7 @@ def main():
             dist.init_process_group("nccl", rank=0, world_size=1)
             config.use_ddp = False # 标记为非 DDP，虽然 Trainer 可能还是用 DDP wrapper，但此时 rank=0
 
+    # 确保设置当前设备
     torch.cuda.set_device(args.local_rank)
     
     # 创建 flat config 供 Trainer 使用 (因为 Trainer 预期 config.lr, config.epochs 等在顶层)
@@ -147,101 +148,26 @@ def main():
         device=f"cuda:{args.local_rank}"
     )
     
-    # 8. 初始化 Trainer
-    if flat_config.local_rank == 0:
-        print("Initializing Trainer...")
-        
-    trainer = Trainer(model, diffusion, vae, train_loader, flat_config)
+    # 8. 开始训练
+    trainer = DiTImangenetTrainer(model, diffusion, vae, train_loader, flat_config)
 
-    # -----------------------------------------------------------------------------
-    # [新增] 9. 处理断点续训 (Resume)
-    # -----------------------------------------------------------------------------
+    # 检查是否需要恢复训练
     start_epoch = 0
     if args.resume:
         if os.path.isfile(args.resume):
-            if flat_config.local_rank == 0:
-                print(f"--- Resuming training from checkpoint: {args.resume} ---")
-            
-            # 确保 map_location 正确，防止在多卡加载时 OOM 或设备错误
-            map_location = {'cuda:%d' % 0: 'cuda:%d' % args.local_rank}
-            checkpoint = torch.load(args.resume, map_location=map_location)
-            
-            # 兼容处理：检查是 纯StateDict 还是 包含元数据的字典
-            state_dict = checkpoint
-            has_metadata = False
-            
-            if isinstance(checkpoint, dict) and "model" in checkpoint:
-                # 这是一个包含元数据的完整 Checkpoint (如果将来你改了保存逻辑)
-                state_dict = checkpoint["model"]
-                has_metadata = True
-            
-            # 1. 加载模型权重
-            # 注意：保存时使用了 model.module.state_dict() (无 module. 前缀)
-            # 加载时如果 trainer.model 是 DDP，需要加载到 trainer.model.module
-            model_to_load = trainer.model.module if hasattr(trainer.model, 'module') else trainer.model
-            
-            try:
-                model_to_load.load_state_dict(state_dict, strict=True)
-                if flat_config.local_rank == 0:
-                    print("Model weights loaded successfully.")
-            except Exception as e:
-                if flat_config.local_rank == 0:
-                    print(f"Strict load failed (keys mismatch?), trying strict=False. Error: {e}")
-                missing, unexpected = model_to_load.load_state_dict(state_dict, strict=False)
-                if flat_config.local_rank == 0:
-                    print(f"Loaded with strict=False. Missing: {len(missing)}, Unexpected: {len(unexpected)}")
-
-            # 2. 恢复 Epoch (尝试从文件名解析)
-            if has_metadata and 'epoch' in checkpoint:
-                start_epoch = checkpoint['epoch'] + 1
-            else:
-                # 尝试从文件名解析 epoch (例如 checkpoint_050.pt -> 50)
-                try:
-                    filename = os.path.basename(args.resume)
-                    # 匹配 _数字.pt 结尾
-                    match = re.search(r'_(\d+)\.pt$', filename)
-                    if match:
-                        epoch_num = int(match.group(1))
-                        start_epoch = epoch_num + 1 # 从下一轮开始
-                        if flat_config.local_rank == 0:
-                            print(f"Inferred resume epoch {start_epoch} from filename '{filename}'.")
-                    else:
-                        if flat_config.local_rank == 0:
-                            print("Could not infer epoch from filename. Starting from epoch 0.")
-                except Exception:
-                    pass
-            
-            # 3. 恢复优化器 (仅当存在元数据时)
-            if has_metadata and hasattr(trainer, 'optimizer') and 'optimizer' in checkpoint:
-                try:
-                    trainer.optimizer.load_state_dict(checkpoint['optimizer'])
-                    if flat_config.local_rank == 0:
-                        print("Optimizer state loaded.")
-                except Exception:
-                    pass
-            elif flat_config.local_rank == 0:
-                print("Note: Optimizer state not found in checkpoint (training with fresh optimizer).")
-            
+            # trainer.resume_checkpoint 应加载状态并返回开始的 epoch
+            start_epoch = trainer.resume_checkpoint(args.resume)
         else:
             if flat_config.local_rank == 0:
-                print(f"Warning: Checkpoint file not found at {args.resume}, starting from scratch.")
+                print(f"Warning: No checkpoint found at '{args.resume}', starting from scratch.")
 
-    # -----------------------------------------------------------------------------
-    # 10. 开始训练循环
-    # -----------------------------------------------------------------------------
     if flat_config.local_rank == 0:
-        print(f"Start Training Loop from epoch {start_epoch}...")
+        print(f"Start Training from Epoch {start_epoch}...")
     
-    # 修改 range 从 start_epoch 开始
     for epoch in range(start_epoch, flat_config.epochs):
         if config.use_ddp:
             train_loader.sampler.set_epoch(epoch)
-        
-        # 训练一个 epoch
         trainer.train_one_epoch(epoch)
-        
-        # 保存 checkpoint (通常 Trainer 内部保存，但这里外部控制也可以)
-        # 这里调用 trainer 的保存方法
         trainer.save_checkpoint(epoch)
 
     cleanup()

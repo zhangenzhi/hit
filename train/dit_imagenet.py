@@ -201,12 +201,52 @@ class Trainer:
                 self.visualize(epoch)
             
             # FID 计算通常比较慢，建议频率低一点，例如每 5 个 epoch
-            if epoch > 0 and epoch % 5 == 0:
-                self.evaluate_fid(epoch)
+            # if epoch > 0 and epoch % 5 == 0:
+            #     self.evaluate_fid(epoch)
                 
     def save_checkpoint(self, epoch):
         if self.config.local_rank == 0:
             checkpoint_path = os.path.join(self.config.results_dir, f"checkpoint_{epoch}.pt")
-            to_save = self.model.module.state_dict() if self.config.use_ddp else self.model.state_dict()
-            torch.save(to_save, checkpoint_path)
+            
+            # 保存完整状态：模型权重、优化器状态、Epoch、配置
+            checkpoint = {
+                "model": self.model.module.state_dict() if self.config.use_ddp else self.model.state_dict(),
+                "optimizer": self.optimizer.state_dict(),
+                "epoch": epoch,
+                "config": self.config,
+            }
+            
+            torch.save(checkpoint, checkpoint_path)
             print(f"Saved checkpoint to {checkpoint_path}")
+            
+            # 同时保存一个 latest.pt 方便自动恢复
+            latest_path = os.path.join(self.config.results_dir, "latest.pt")
+            torch.save(checkpoint, latest_path)
+
+    def resume_checkpoint(self, checkpoint_path):
+        """
+        从 Checkpoint 恢复模型和优化器状态
+        返回: start_epoch (int)
+        """
+        print(f"Loading checkpoint from {checkpoint_path}...")
+        # 确保加载到正确的设备
+        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+        
+        # 1. 加载模型权重
+        model_state_dict = checkpoint["model"]
+        if self.config.use_ddp:
+            self.model.module.load_state_dict(model_state_dict)
+        else:
+            self.model.load_state_dict(model_state_dict)
+        print("Model weights loaded.")
+
+        # 2. 加载优化器状态
+        if "optimizer" in checkpoint and self.optimizer is not None:
+            self.optimizer.load_state_dict(checkpoint["optimizer"])
+            print("Optimizer state loaded.")
+            
+        # 3. 获取开始 Epoch
+        start_epoch = checkpoint.get("epoch", -1) + 1
+        print(f"Resuming training from epoch {start_epoch}")
+        
+        return start_epoch
