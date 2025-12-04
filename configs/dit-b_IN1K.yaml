@@ -2,7 +2,7 @@
 
 data:
   # 请修改为实际的 ImageNet 路径
-  data_path: "/work/c30636/dataset/imagenet/"
+  data_path: "/work/c30778/dataset/imagenet/"
   image_size: 256
   num_workers: 4
 
