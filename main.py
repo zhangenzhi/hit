@@ -9,7 +9,7 @@ from types import SimpleNamespace
 
 # 导入你的模块
 from model.dit import DiT
-from diffusion.ddim import GaussianDiffusion
+from diffusion.gaussian_diffusion import GaussianDiffusion
 from train.dit_imagenet import DiTImangenetTrainer
 # 关键：导入你提供的 dataloader 构建函数
 from dataset.dit_imagenet import build_dit_dataloaders
