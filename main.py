@@ -10,7 +10,7 @@ from types import SimpleNamespace
 # 导入你的模块
 from model.dit import DiT
 from diffusion.ddim import GaussianDiffusion
-from train.dit_imagenet import Trainer
+from train.dit_imagenet import DiTImangenetTrainer
 # 关键：导入你提供的 dataloader 构建函数
 from dataset.dit_imagenet import build_dit_dataloaders
 
@@ -153,7 +153,7 @@ def main():
     if flat_config.local_rank == 0:
         print("Start Training...")
         
-    trainer = Trainer(model, diffusion, vae, train_loader, flat_config)
+    trainer = DiTImangenetTrainer(model, diffusion, vae, train_loader, flat_config)
     
     for epoch in range(flat_config.epochs):
         if config.use_ddp:
