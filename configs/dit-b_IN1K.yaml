@@ -4,7 +4,7 @@ data:
   # 请修改为实际的 ImageNet 路径
   data_path: "/work/c30778/dataset/imagenet/"
   image_size: 256
-  num_workers: 4
+  num_workers: 32
 
 model:
   # DiT-XL/2 Config
@@ -24,7 +24,7 @@ diffusion:
 
 training:
   epochs: 100
-  batch_size: 32      # Per GPU batch size
+  batch_size: 256      # Per GPU batch size
   lr: 0.0001          # 1e-4
   results_dir: "./results/dit_xl_2"
   use_amp: True       # 使用 BF16/FP16 混合精度
