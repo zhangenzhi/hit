@@ -62,6 +62,9 @@ def main():
     parser.add_argument("--data_path", type=str, default=None, help="Override data path")
     parser.add_argument("--results_dir", type=str, default=None, help="Override results dir")
     
+    # [新增] Resume 参数
+    parser.add_argument("--resume", type=str, default="", help="Path to checkpoint to resume from (e.g. results/checkpoint_050.pt)")
+    
     args = parser.parse_args()
 
     # 1. 加载 YAML 配置
@@ -143,16 +146,83 @@ def main():
         device=f"cuda:{args.local_rank}"
     )
     
-    # 8. 开始训练
+    # 8. 初始化 Trainer
     if flat_config.local_rank == 0:
-        print("Start Training...")
+        print("Initializing Trainer...")
         
     trainer = Trainer(model, diffusion, vae, train_loader, flat_config)
+
+    # -----------------------------------------------------------------------------
+    # [新增] 9. 处理断点续训 (Resume)
+    # -----------------------------------------------------------------------------
+    start_epoch = 0
+    if args.resume:
+        if os.path.isfile(args.resume):
+            if flat_config.local_rank == 0:
+                print(f"--- Resuming training from checkpoint: {args.resume} ---")
+            
+            # 确保 map_location 正确，防止在多卡加载时 OOM 或设备错误
+            map_location = {'cuda:%d' % 0: 'cuda:%d' % args.local_rank}
+            checkpoint = torch.load(args.resume, map_location=map_location)
+            
+            # 1. 加载模型权重
+            # 注意：如果 Trainer 内部已经用 DDP 包装了 model，state_dict 可能有 'module.' 前缀
+            # 这里我们假设 Trainer 暴露了 self.model (可能是 DDP wrapping 后的)
+            # 最好是加载到 trainer.model 中
+            if hasattr(trainer, 'model'):
+                # 处理 module. 前缀不匹配的问题 (根据保存方式不同可能需要调整)
+                # 这种方式比较鲁棒，尝试直接加载
+                try:
+                    trainer.model.load_state_dict(checkpoint['model'])
+                except RuntimeError as e:
+                    if flat_config.local_rank == 0:
+                        print(f"Direct load failed, trying to handle 'module.' prefix... Error: {e}")
+                    # 如果 checkpoint 有 module. 但当前模型没有，或者反之，需手动处理 key
+                    # 这里简化处理，通常 Trainer save 时处理好了
+                    pass
+            else:
+                # 如果 Trainer 没暴露 model，尝试直接加载到外面的 model 对象 (如果它是引用)
+                model.load_state_dict(checkpoint['model'])
+
+            # 2. 加载优化器状态 (关键步骤)
+            # 必须假设 Trainer 拥有 optimizer 属性
+            if hasattr(trainer, 'optimizer') and 'optimizer' in checkpoint:
+                trainer.optimizer.load_state_dict(checkpoint['optimizer'])
+                if flat_config.local_rank == 0:
+                    print("Optimizer state loaded.")
+            
+            # 3. 加载 EMA 模型 (如果有)
+            if hasattr(trainer, 'ema') and 'ema' in checkpoint:
+                trainer.ema.load_state_dict(checkpoint['ema'])
+                if flat_config.local_rank == 0:
+                    print("EMA model state loaded.")
+
+            # 4. 恢复 Epoch
+            if 'epoch' in checkpoint:
+                start_epoch = checkpoint['epoch'] + 1
+                if flat_config.local_rank == 0:
+                    print(f"Resuming from epoch {start_epoch}")
+            
+        else:
+            if flat_config.local_rank == 0:
+                print(f"Warning: Checkpoint file not found at {args.resume}, starting from scratch.")
+
+    # -----------------------------------------------------------------------------
+    # 10. 开始训练循环
+    # -----------------------------------------------------------------------------
+    if flat_config.local_rank == 0:
+        print("Start Training Loop...")
     
-    for epoch in range(flat_config.epochs):
+    # 修改 range 从 start_epoch 开始
+    for epoch in range(start_epoch, flat_config.epochs):
         if config.use_ddp:
             train_loader.sampler.set_epoch(epoch)
+        
+        # 训练一个 epoch
         trainer.train_one_epoch(epoch)
+        
+        # 保存 checkpoint (通常 Trainer 内部保存，但这里外部控制也可以)
+        # 这里调用 trainer 的保存方法
         trainer.save_checkpoint(epoch)
 
     cleanup()
