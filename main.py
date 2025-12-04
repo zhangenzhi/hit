@@ -6,6 +6,7 @@ import torch
 import torch.distributed as dist
 from diffusers.models import AutoencoderKL
 from types import SimpleNamespace
+import re # [新增] 用于解析文件名中的 epoch
 
 # -----------------------------------------------------------------------------
 # 1. 路径设置: 将项目根目录添加到 sys.path 以便导入模块
@@ -165,43 +166,61 @@ def main():
             map_location = {'cuda:%d' % 0: 'cuda:%d' % args.local_rank}
             checkpoint = torch.load(args.resume, map_location=map_location)
             
-            # 1. 加载模型权重
-            # 注意：如果 Trainer 内部已经用 DDP 包装了 model，state_dict 可能有 'module.' 前缀
-            # 这里我们假设 Trainer 暴露了 self.model (可能是 DDP wrapping 后的)
-            # 最好是加载到 trainer.model 中
-            if hasattr(trainer, 'model'):
-                # 处理 module. 前缀不匹配的问题 (根据保存方式不同可能需要调整)
-                # 这种方式比较鲁棒，尝试直接加载
-                try:
-                    trainer.model.load_state_dict(checkpoint['model'])
-                except RuntimeError as e:
-                    if flat_config.local_rank == 0:
-                        print(f"Direct load failed, trying to handle 'module.' prefix... Error: {e}")
-                    # 如果 checkpoint 有 module. 但当前模型没有，或者反之，需手动处理 key
-                    # 这里简化处理，通常 Trainer save 时处理好了
-                    pass
-            else:
-                # 如果 Trainer 没暴露 model，尝试直接加载到外面的 model 对象 (如果它是引用)
-                model.load_state_dict(checkpoint['model'])
-
-            # 2. 加载优化器状态 (关键步骤)
-            # 必须假设 Trainer 拥有 optimizer 属性
-            if hasattr(trainer, 'optimizer') and 'optimizer' in checkpoint:
-                trainer.optimizer.load_state_dict(checkpoint['optimizer'])
-                if flat_config.local_rank == 0:
-                    print("Optimizer state loaded.")
+            # 兼容处理：检查是 纯StateDict 还是 包含元数据的字典
+            state_dict = checkpoint
+            has_metadata = False
             
-            # 3. 加载 EMA 模型 (如果有)
-            if hasattr(trainer, 'ema') and 'ema' in checkpoint:
-                trainer.ema.load_state_dict(checkpoint['ema'])
+            if isinstance(checkpoint, dict) and "model" in checkpoint:
+                # 这是一个包含元数据的完整 Checkpoint (如果将来你改了保存逻辑)
+                state_dict = checkpoint["model"]
+                has_metadata = True
+            
+            # 1. 加载模型权重
+            # 注意：保存时使用了 model.module.state_dict() (无 module. 前缀)
+            # 加载时如果 trainer.model 是 DDP，需要加载到 trainer.model.module
+            model_to_load = trainer.model.module if hasattr(trainer.model, 'module') else trainer.model
+            
+            try:
+                model_to_load.load_state_dict(state_dict, strict=True)
                 if flat_config.local_rank == 0:
-                    print("EMA model state loaded.")
+                    print("Model weights loaded successfully.")
+            except Exception as e:
+                if flat_config.local_rank == 0:
+                    print(f"Strict load failed (keys mismatch?), trying strict=False. Error: {e}")
+                missing, unexpected = model_to_load.load_state_dict(state_dict, strict=False)
+                if flat_config.local_rank == 0:
+                    print(f"Loaded with strict=False. Missing: {len(missing)}, Unexpected: {len(unexpected)}")
 
-            # 4. 恢复 Epoch
-            if 'epoch' in checkpoint:
+            # 2. 恢复 Epoch (尝试从文件名解析)
+            if has_metadata and 'epoch' in checkpoint:
                 start_epoch = checkpoint['epoch'] + 1
-                if flat_config.local_rank == 0:
-                    print(f"Resuming from epoch {start_epoch}")
+            else:
+                # 尝试从文件名解析 epoch (例如 checkpoint_050.pt -> 50)
+                try:
+                    filename = os.path.basename(args.resume)
+                    # 匹配 _数字.pt 结尾
+                    match = re.search(r'_(\d+)\.pt$', filename)
+                    if match:
+                        epoch_num = int(match.group(1))
+                        start_epoch = epoch_num + 1 # 从下一轮开始
+                        if flat_config.local_rank == 0:
+                            print(f"Inferred resume epoch {start_epoch} from filename '{filename}'.")
+                    else:
+                        if flat_config.local_rank == 0:
+                            print("Could not infer epoch from filename. Starting from epoch 0.")
+                except Exception:
+                    pass
+            
+            # 3. 恢复优化器 (仅当存在元数据时)
+            if has_metadata and hasattr(trainer, 'optimizer') and 'optimizer' in checkpoint:
+                try:
+                    trainer.optimizer.load_state_dict(checkpoint['optimizer'])
+                    if flat_config.local_rank == 0:
+                        print("Optimizer state loaded.")
+                except Exception:
+                    pass
+            elif flat_config.local_rank == 0:
+                print("Note: Optimizer state not found in checkpoint (training with fresh optimizer).")
             
         else:
             if flat_config.local_rank == 0:
@@ -211,7 +230,7 @@ def main():
     # 10. 开始训练循环
     # -----------------------------------------------------------------------------
     if flat_config.local_rank == 0:
-        print("Start Training Loop...")
+        print(f"Start Training Loop from epoch {start_epoch}...")
     
     # 修改 range 从 start_epoch 开始
     for epoch in range(start_epoch, flat_config.epochs):
