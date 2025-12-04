@@ -101,7 +101,10 @@ class DiT(nn.Module):
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, hidden_size), requires_grad=False)
 
         self.t_embedder = TimestepEmbedder(hidden_size)
-        self.y_embedder = nn.Embedding(num_classes, hidden_size, padding_idx=num_classes)
+        
+        # FIX: num_embeddings 必须比 padding_idx 大至少 1
+        # 这里的 num_classes + 1 是为了给 unconstrained (null class) 留一个 embedding slot
+        self.y_embedder = nn.Embedding(num_classes + 1, hidden_size, padding_idx=num_classes)
 
         self.blocks = nn.ModuleList([
             DiTBlock(hidden_size, num_heads) for _ in range(depth)
