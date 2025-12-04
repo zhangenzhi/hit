@@ -2,11 +2,44 @@ import torch
 import numpy as np
 import matplotlib.pyplot as plt
 from PIL import Image
-# import requests # 不再需要网络请求
-# from io import BytesIO # 不再需要字节流
+
 from diffusers import AutoencoderKL
 from torchvision import transforms
 
+import torch
+
+class GaussianDiffusion:
+    def __init__(self, num_timesteps=1000, beta_start=1e-4, beta_end=0.02, device="cuda"):
+        self.num_timesteps = num_timesteps
+        self.device = device
+        
+        # Linear Beta Schedule
+        self.betas = torch.linspace(beta_start, beta_end, num_timesteps, dtype=torch.float64).to(device)
+        self.alphas = 1.0 - self.betas
+        self.alphas_cumprod = torch.cumprod(self.alphas, dim=0)
+        
+        self.sqrt_alphas_cumprod = torch.sqrt(self.alphas_cumprod).float()
+        self.sqrt_one_minus_alphas_cumprod = torch.sqrt(1.0 - self.alphas_cumprod).float()
+
+    def q_sample(self, x_start, t, noise=None):
+        if noise is None:
+            noise = torch.randn_like(x_start)
+        sqrt_alpha = self.sqrt_alphas_cumprod[t].reshape(-1, 1, 1, 1)
+        sqrt_one_minus_alpha = self.sqrt_one_minus_alphas_cumprod[t].reshape(-1, 1, 1, 1)
+        return sqrt_alpha * x_start + sqrt_one_minus_alpha * noise
+
+    def p_losses(self, model, x_start, t, y, noise=None):
+        if noise is None:
+            noise = torch.randn_like(x_start)
+        x_t = self.q_sample(x_start, t, noise)
+        model_output = model(x_t, t, y)
+        
+        # 如果模型学习方差，输出通道是 2*C，前 C 个是噪声预测
+        if model_output.shape[1] == 2 * x_start.shape[1]:
+            model_output, _ = model_output.chunk(2, dim=1)
+            
+        return torch.nn.functional.mse_loss(model_output, noise)
+    
 # -----------------------------------------------------------------------------
 # 1. 简易的扩散调度器 (与 diffusion/gaussian_diffusion.py 逻辑一致)
 # -----------------------------------------------------------------------------
