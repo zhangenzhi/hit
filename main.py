@@ -56,7 +56,7 @@ def cleanup():
 
 def main():
     parser = argparse.ArgumentParser(description="Train DiT on ImageNet")
-    parser.add_argument("--config", type=str, default="./configs/dit-b_IN1K.yaml", help="Path to config yaml")
+    parser.add_argument("--config", type=str, default="./configs/dit-xl_IN1K.yaml", help="Path to config yaml")
     parser.add_argument("--local-rank", type=int, default=int(os.environ.get("LOCAL_RANK", 0)), help="Local rank for DDP")
     
     # 允许命令行覆盖关键参数
