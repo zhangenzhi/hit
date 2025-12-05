@@ -5,7 +5,7 @@ data:
   # 请修改为实际的 ImageNet 路径
   data_path: "/work/c30778/dataset/imagenet/"
   image_size: 256
-  num_workers: 8
+  num_workers: 32
 
 model:
   # DiT-B Config
@@ -30,7 +30,7 @@ diffusion:
 
 training:
   epochs: 100
-  batch_size: 64      # DiT-B 较小，H100 上可以适当增大 Batch Size (例如 64 或 128)
+  batch_size: 128      # DiT-B 较小，H100 上可以适当增大 Batch Size (例如 64 或 128)
   lr: 0.0001          # 1e-4
   results_dir: "./results/dit_b_2"
   use_amp: True       # 使用 BF16/FP16 混合精度
