@@ -7,19 +7,17 @@ import torch.distributed as dist
 from diffusers.models import AutoencoderKL
 from types import SimpleNamespace
 
-# 导入你的模块
-from model.dit import DiT
-from diffusion.gaussian_diffusion import GaussianDiffusion
-from train.dit_imagenet import DiTImangenetTrainer
-# 关键：导入你提供的 dataloader 构建函数
-from dataset.dit_imagenet import build_dit_dataloaders
-
 # -----------------------------------------------------------------------------
 # 1. 路径设置: 将项目根目录添加到 sys.path 以便导入模块
 # -----------------------------------------------------------------------------
 current_dir = os.path.dirname(os.path.abspath(__file__))
 root_dir = os.path.dirname(current_dir)
 sys.path.append(root_dir)
+
+from model.dit import DiT
+from diffusion.gaussian_diffusion import GaussianDiffusion
+from train.dit_imagenet import DiTImangenetTrainer # 确保 Trainer 类名一致
+from dataset.dit_latent_imagenet import build_dit_dataloaders
 
 def dict_to_namespace(d):
     """
@@ -35,18 +33,15 @@ def dict_to_namespace(d):
 
 def flatten_config(config_ns):
     """
-    将嵌套的配置打平，方便 Trainer 访问 (兼容旧 Trainer 代码)
+    将嵌套的配置打平，方便 Trainer 访问
     """
     flat_cfg = SimpleNamespace()
-    
-    # 递归提取所有属性
     def _extract(ns):
         for k, v in ns.__dict__.items():
             if isinstance(v, SimpleNamespace):
                 _extract(v)
             else:
                 setattr(flat_cfg, k, v)
-    
     _extract(config_ns)
     return flat_cfg
 
@@ -56,13 +51,12 @@ def cleanup():
 
 def main():
     parser = argparse.ArgumentParser(description="Train DiT on ImageNet")
-    parser.add_argument("--config", type=str, default="./configs/dit-xl_IN1K.yaml", help="Path to config yaml")
+    parser.add_argument("--config", type=str, default="./configs/dit_imagenet.yaml", help="Path to config yaml")
     parser.add_argument("--local-rank", type=int, default=int(os.environ.get("LOCAL_RANK", 0)), help="Local rank for DDP")
     
     # 允许命令行覆盖关键参数
     parser.add_argument("--data_path", type=str, default=None, help="Override data path")
     parser.add_argument("--results_dir", type=str, default=None, help="Override results dir")
-    # 新增 resume 参数
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume from")
     
     args = parser.parse_args()
@@ -85,25 +79,20 @@ def main():
     config.use_ddp = True # 默认开启 DDP 逻辑
 
     # 3. 初始化分布式环境
-    # 修改点：使用 is_initialized() 替代 try-except，更稳健
     if not dist.is_initialized():
-        # 如果是 torchrun 启动，env 变量已设置
         if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
             dist.init_process_group("nccl")
         else:
-            # 单机单卡调试模式
             print("Not running in DDP mode, initializing mock process group for single GPU.")
             os.environ["MASTER_ADDR"] = "localhost"
             os.environ["MASTER_PORT"] = "12355"
             dist.init_process_group("nccl", rank=0, world_size=1)
-            config.use_ddp = False # 标记为非 DDP，虽然 Trainer 可能还是用 DDP wrapper，但此时 rank=0
+            config.use_ddp = False 
 
-    # 确保设置当前设备
     torch.cuda.set_device(args.local_rank)
     
-    # 创建 flat config 供 Trainer 使用 (因为 Trainer 预期 config.lr, config.epochs 等在顶层)
+    # 创建 flat config 供 Trainer 使用
     flat_config = flatten_config(config)
-    # 手动补充 Trainer 需要的额外 flag
     flat_config.local_rank = args.local_rank
     flat_config.use_ddp = config.use_ddp
     
@@ -115,13 +104,14 @@ def main():
         print(f"Training on {torch.cuda.device_count()} GPUs")
 
     # 4. 构建 DataLoaders
-    # build_dit_dataloaders 接受一个对象，我们传入 flat_config 即可，它包含 data_path, batch_size 等
+    # 这里的 build_dit_dataloaders 现在会根据 flat_config.data_path 的内容
+    # 自动决定是返回 ImageFolder (Pixel) 还是 LatentFolder (Latent)
     loaders = build_dit_dataloaders(flat_config)
     train_loader = loaders['train']
 
-    # 5. 初始化 VAE (冻结)
+    # 5. 初始化 VAE (即使是 Latent 模式，为了 FID 评估的 Decode 阶段，VAE 依然需要)
     if flat_config.local_rank == 0:
-        print("Loading VAE...")
+        print("Loading VAE (for decoding/evaluation)...")
     vae = AutoencoderKL.from_pretrained("stabilityai/sd-vae-ft-mse")
     for param in vae.parameters():
         param.requires_grad = False
@@ -129,6 +119,11 @@ def main():
     # 6. 初始化 DiT 模型
     if flat_config.local_rank == 0:
         print("Initializing DiT Model...")
+    
+    # 如果是 Latent 模式，输入已经是压缩后的特征，input_size 应该是 32 (256/8)
+    # 我们的 Config 默认就是 32，所以不需要改动。
+    # 只是如果换了 Pixel 模式，DataLoader 会负责 Resize 到 256，
+    # 而 Trainer 内部会负责 Encode 到 32，逻辑是闭环的。
     model = DiT(
         input_size=config.model.input_size,
         patch_size=config.model.patch_size,
@@ -136,7 +131,8 @@ def main():
         hidden_size=config.model.hidden_size,
         depth=config.model.depth,
         num_heads=config.model.num_heads,
-        learn_sigma=config.model.learn_sigma,
+        # learn_sigma=config.model.learn_sigma, # 你的新 DiT 实现可能没有这个参数，如果是标准 DiT 则内置了
+        class_dropout_prob=0.1,
         num_classes=config.model.num_classes
     )
     
@@ -145,24 +141,27 @@ def main():
         num_timesteps=config.diffusion.num_timesteps,
         beta_start=config.diffusion.beta_start,
         beta_end=config.diffusion.beta_end,
+        schedule="cosine", # 强烈建议使用 Cosine Schedule
         device=f"cuda:{args.local_rank}"
     )
     
     # 8. 开始训练
+    if flat_config.local_rank == 0:
+        print("Start Training...")
+        
     trainer = DiTImangenetTrainer(model, diffusion, vae, train_loader, flat_config)
 
-    # 检查是否需要恢复训练
+    # 检查恢复训练
     start_epoch = 0
     if args.resume:
         if os.path.isfile(args.resume):
-            # trainer.resume_checkpoint 应加载状态并返回开始的 epoch
             start_epoch = trainer.resume_checkpoint(args.resume)
         else:
             if flat_config.local_rank == 0:
                 print(f"Warning: No checkpoint found at '{args.resume}', starting from scratch.")
 
     if flat_config.local_rank == 0:
-        print(f"Start Training from Epoch {start_epoch}...")
+        print(f"Training Loop: Epoch {start_epoch} -> {flat_config.epochs}")
     
     for epoch in range(start_epoch, flat_config.epochs):
         if config.use_ddp:

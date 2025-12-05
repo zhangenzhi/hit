@@ -130,11 +130,31 @@ class DiTImangenetTrainer:
         self.model.eval()
         self.fid_metric.reset()
 
+<<<<<<< Updated upstream
         # 1. Real Images
         for i, (real_imgs, _) in enumerate(self.loader):
             if i >= num_gen_batches: break
             real_imgs = real_imgs.to(self.device)
             real_imgs = ((real_imgs + 1.0) / 2.0).clamp(0.0, 1.0)
+=======
+        # 1. Real Images (支持 Pixel 或 Latent)
+        for i, (real_imgs, _) in enumerate(self.loader):
+            if i >= num_gen_batches: break
+            real_imgs = real_imgs.to(self.device)
+            
+            # --- 新增: 检查输入是否为 Latent (4通道) ---
+            if real_imgs.shape[1] == 4:
+                # 如果是 Latent，需要解码回 Pixel 才能计算 FID
+                # 假设输入的 Latent 是未缩放的 (unscaled)，所以需要 / 0.18215
+                # 如果你存的时候已经缩放了，这里请去掉除法
+                real_imgs = self.vae.decode(real_imgs / 0.18215).sample
+                real_imgs = real_imgs.clamp(-1, 1)
+            # ------------------------------------------
+
+            # [-1, 1] -> [0, 1]
+            real_imgs = ((real_imgs + 1.0) / 2.0).clamp(0.0, 1.0)
+            # Float32 -> UInt8 [0, 255] for TorchMetrics
+>>>>>>> Stashed changes
             real_imgs_uint8 = (real_imgs * 255.0).to(torch.uint8)
             self.fid_metric.update(real_imgs_uint8, real=True)
         
@@ -187,9 +207,17 @@ class DiTImangenetTrainer:
             images = images.to(self.device)
             labels = labels.to(self.device)
             
-            with torch.no_grad():
-                posterior = self.vae.encode(images).latent_dist
-                latents = posterior.sample() * 0.18215
+            # --- 自动判断输入类型: Pixel vs Latent ---
+            if images.shape[1] == 3:
+                # 3通道 -> Pixel Space，需要 VAE 编码 (On-the-fly)
+                with torch.no_grad():
+                    posterior = self.vae.encode(images).latent_dist
+                    latents = posterior.sample().mul_(0.18215)
+            else:
+                # 4通道 -> Latent Space (Pre-computed)
+                # 假设预处理保存的是原始 sample (unscaled)，所以需要乘系数
+                latents = images * 0.18215
+            # ---------------------------------------
                 
             t = torch.randint(0, self.diffusion.num_timesteps, (images.shape[0],), device=self.device)
             
