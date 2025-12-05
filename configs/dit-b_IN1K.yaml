@@ -41,4 +41,4 @@ training:
   # --- 调试与快速测试配置 ---
   # 设置每个 Epoch 的最大训练步数。
   # 调试时设为 100 或 1000，正式训练时请注释掉或设为 null
-  max_train_steps: 5000
+  max_train_steps: 500
