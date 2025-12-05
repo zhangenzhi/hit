@@ -140,11 +140,9 @@ class DiTImangenetTrainer:
         for i, (real_imgs, _) in enumerate(self.loader):
             if i >= num_real_batches: break
             real_imgs = real_imgs.to(self.device)
-            # 修正: 转换为 Float [0, 1] 而不是 uint8
-            # Inception v3 默认接受 [0, 1] float 或 [0, 255] uint8
-            # 使用 float 精度更高，避免提前量化
-            real_imgs = (real_imgs + 1.0) / 2.0 
-            real_imgs = real_imgs.clamp(0.0, 1.0)
+            # 修正: 严格转换为 uint8 [0, 255]
+            # real_imgs 原始范围 [-1, 1]
+            real_imgs = ((real_imgs + 1.0) / 2.0 * 255.0).clamp(0, 255).to(torch.uint8)
             self.fid_metric.update(real_imgs, real=True)
         
         # 2. 更新生成图片分布 (Fake) - 并行生成
@@ -161,9 +159,8 @@ class DiTImangenetTrainer:
             z = self.sample_ddim(n_samples, labels, latent_size, num_inference_steps=50)
             
             fake_imgs = self.vae.decode(z / 0.18215).sample
-            # 修正: 转换为 Float [0, 1]
-            fake_imgs = (fake_imgs + 1.0) / 2.0
-            fake_imgs = fake_imgs.clamp(0.0, 1.0)
+            # 修正: 严格转换为 uint8 [0, 255]
+            fake_imgs = ((fake_imgs + 1.0) / 2.0 * 255.0).clamp(0, 255).to(torch.uint8)
             
             self.fid_metric.update(fake_imgs, real=False)
             
