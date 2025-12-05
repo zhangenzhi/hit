@@ -104,7 +104,10 @@ class DiTImangenetTrainer:
         latent_size = (in_channels, input_size, input_size)
 
         z = self.sample_ddim(n_samples, labels, latent_size, num_inference_steps=50)
-        x_recon = self.vae.decode(z.to(self.dtype) / 0.18215).sample.float()
+        
+        # 修复: 移除 .to(self.dtype)
+        # sample_ddim 返回的是 float32, VAE 也是 float32, 直接除以缩放因子即可
+        x_recon = self.vae.decode(z / 0.18215).sample.float()
         x_recon = torch.clamp((x_recon + 1.0) / 2.0, 0.0, 1.0)
         
         save_path = os.path.join(self.config.results_dir, f"sample_epoch_{epoch}.png")
@@ -146,16 +149,15 @@ class DiTImangenetTrainer:
             
             z = self.sample_ddim(n_samples, labels, latent_size, num_inference_steps=50)
             
-            fake_imgs = self.vae.decode(z.to(self.dtype) / 0.18215).sample.float()
+            # 修复: 移除 .to(self.dtype)，保持 float32 传入 VAE
+            fake_imgs = self.vae.decode(z / 0.18215).sample.float()
             fake_imgs = ((fake_imgs + 1.0) / 2.0).clamp(0.0, 1.0)
             
-            # --- 新增: 在计算 FID 时直接保存图片 (Rank 0, First Batch) ---
+            # 在计算 FID 时直接保存图片 (Rank 0, First Batch)
             if i == 0 and self.config.local_rank == 0:
-                # 保存前 8 张生成的图片
                 save_path = os.path.join(self.config.results_dir, f"fid_samples_epoch_{epoch}.png")
                 save_image(fake_imgs[:8], save_path, nrow=4)
                 print(f"[Visual] Saved FID evaluation samples to {save_path}")
-            # --------------------------------------------------------
 
             fake_imgs_uint8 = (fake_imgs * 255.0).to(torch.uint8)
             self.fid_metric.update(fake_imgs_uint8, real=False)
@@ -204,16 +206,11 @@ class DiTImangenetTrainer:
                 start_time = time()
 
         if self.config.local_rank == 0:
-            # 如果配置了 FID 评估间隔，则不在此处单独调用 visualize，避免重复生成
-            # 如果不跑 FID，则保留轻量级 visualize
             viz_interval = getattr(self.config, 'log_interval', 1)
             # 只有当本 epoch 不会跑 evaluate_fid 时才跑 visualize
             if epoch % viz_interval == 0 and not (epoch > 0 and epoch % 5 == 0):
                 self.visualize(epoch)
             
-            # FID 评估频率
-            # 确保 evaluate_fid 被调用（注意 evaluate_fid 内部有 barrier，所以所有 rank 都要调）
-        
         # 修正逻辑：所有 rank 必须同步决定是否跑 FID
         if epoch > 0 and epoch % 5 == 0:
              # num_gen_batches 可以设大一点，因为是分布式生成
