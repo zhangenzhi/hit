@@ -137,13 +137,23 @@ class DiTImangenetTrainer:
         self.model.train()
         start_time = time()
         
+        # 获取最大步数限制 (用于快速测试)
+        max_steps = getattr(self.config, 'max_train_steps', None)
+        
         for step, (images, labels) in enumerate(self.loader):
+            # 1. 快速测试截断逻辑
+            if max_steps is not None and step >= max_steps:
+                if self.config.local_rank == 0:
+                    print(f"Debug: Max steps {max_steps} reached, breaking epoch.")
+                break
+
             images = images.to(self.device)
             labels = labels.to(self.device)
             
             with torch.no_grad():
-                dist = self.vae.encode(images).latent_dist
-                latents = dist.sample() * 0.18215
+                # 修复: 变量名 dist -> posterior，避免覆盖 torch.distributed
+                posterior = self.vae.encode(images).latent_dist
+                latents = posterior.sample() * 0.18215
                 
             t = torch.randint(0, self.diffusion.num_timesteps, (images.shape[0],), device=self.device)
             
