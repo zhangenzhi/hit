@@ -51,14 +51,9 @@ class DiTBlock(nn.Module):
 
     def forward(self, x, c):
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=1)
-        
-        # Self-Attention
         x_norm1 = modulate(self.norm1(x), shift_msa, scale_msa)
-        # 推荐: 使用 F.scaled_dot_product_attention 以利用 Flash Attention
         attn_out, _ = self.attn(x_norm1, x_norm1, x_norm1)
         x = x + gate_msa.unsqueeze(1) * attn_out
-        
-        # MLP
         x_norm2 = modulate(self.norm2(x), shift_mlp, scale_mlp)
         x = x + gate_mlp.unsqueeze(1) * self.mlp(x_norm2)
         return x
@@ -96,14 +91,10 @@ class DiT(nn.Module):
         self.patch_size = patch_size
 
         self.x_embedder = nn.Conv2d(in_channels, hidden_size, kernel_size=patch_size, stride=patch_size)
-        
         num_patches = (input_size // patch_size) ** 2
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, hidden_size), requires_grad=False)
 
         self.t_embedder = TimestepEmbedder(hidden_size)
-        
-        # FIX: num_embeddings 必须比 padding_idx 大至少 1
-        # 这里的 num_classes + 1 是为了给 unconstrained (null class) 留一个 embedding slot
         self.y_embedder = nn.Embedding(num_classes + 1, hidden_size, padding_idx=num_classes)
 
         self.blocks = nn.ModuleList([
@@ -113,19 +104,34 @@ class DiT(nn.Module):
         self.initialize_weights()
 
     def initialize_weights(self):
-        # 初始化逻辑 (简略)
-        nn.init.normal_(self.x_embedder.weight, std=0.02)
+        # Basic Init
+        def _basic_init(module):
+            if isinstance(module, nn.Linear):
+                torch.nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.constant_(module.bias, 0)
+        self.apply(_basic_init)
+
+        # Embedder Init
+        w = self.x_embedder.weight.data
+        nn.init.xavier_uniform_(w.view([w.shape[0], -1]))
+        nn.init.constant_(self.x_embedder.bias, 0)
         nn.init.normal_(self.y_embedder.weight, std=0.02)
         nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
         nn.init.normal_(self.t_embedder.mlp[2].weight, std=0.02)
-        
+
         # Zero-out adaLN modulation layers
         for block in self.blocks:
             nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
             nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
+        
+        # adaLN modulation zero init
         nn.init.constant_(self.final_layer.adaLN_modulation[-1].weight, 0)
         nn.init.constant_(self.final_layer.adaLN_modulation[-1].bias, 0)
-        nn.init.constant_(self.final_layer.linear.weight, 0)
+        
+        # 关键修改：取消 Final Layer 的全零初始化，改用小幅随机初始化
+        # 这有助于解决 Loss 停滞问题，给梯度一个非零的起点
+        nn.init.normal_(self.final_layer.linear.weight, mean=0.0, std=0.02)
         nn.init.constant_(self.final_layer.linear.bias, 0)
 
     def unpatchify(self, x):
@@ -138,15 +144,12 @@ class DiT(nn.Module):
 
     def forward(self, x, t, y):
         x = self.x_embedder(x)
-        x = x.flatten(2).transpose(1, 2) # (N, L, D)
+        x = x.flatten(2).transpose(1, 2)
         x = x + self.pos_embed
-
         t_emb = self.t_embedder(t)
         y_emb = self.y_embedder(y)
         c = t_emb + y_emb
-
         for block in self.blocks:
             x = block(x, c)
-
         x = self.final_layer(x, c)
         return self.unpatchify(x)
