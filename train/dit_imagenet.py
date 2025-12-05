@@ -26,8 +26,7 @@ class DiTImangenetTrainer:
         )
         self.loader = loader
         
-        # 关键：混合精度开关
-        # 如果 Loss 仍然奇怪，可以在 Config 中设置 use_amp: False 来排查
+        # 混合精度开关
         self.use_amp = getattr(config, 'use_amp', True)
         self.dtype = torch.bfloat16 if self.use_amp else torch.float32
         
@@ -47,12 +46,12 @@ class DiTImangenetTrainer:
     @torch.no_grad()
     def sample_ddim(self, n, labels, size, num_inference_steps=50, eta=0.0):
         """
-        DDIM 快速采样 (强制 FP32 计算，确保精度)
+        DDIM 快速采样 (强制 FP32 计算)
         """
         self.model.eval()
         raw_model = self.model.module if isinstance(self.model, DDP) else self.model
         
-        # 1. 构造时间步 (999 -> 0)
+        # 1. 构造时间步
         step_ratio = self.diffusion.num_timesteps // num_inference_steps
         timesteps = (np.arange(0, num_inference_steps) * step_ratio).round()[::-1].copy().astype(int)
         
@@ -61,11 +60,11 @@ class DiTImangenetTrainer:
         for i, t_step in enumerate(timesteps):
             t = torch.full((n,), t_step, device=self.device, dtype=torch.long)
             
-            # 2.1 预测噪声 (跟随 AMP 设置或强制 float32，这里跟随 AMP 以保持一致性)
+            # 2.1 预测噪声
             with torch.amp.autocast('cuda', dtype=self.dtype) if self.use_amp else nullcontext():
                 model_output = raw_model(x, t, labels)
             
-            # 关键：计算必须用 float32
+            # 计算必须用 float32
             model_output = model_output.float()
             x = x.float()
             
@@ -75,9 +74,7 @@ class DiTImangenetTrainer:
             # 2.2 参数获取
             alpha_bar_t = self.diffusion.alphas_cumprod[t_step].to(self.device).float()
             
-            # 修正 prev_t 逻辑
             if i == len(timesteps) - 1:
-                # 最后一步，去噪到 t=0 之后，认为 prev_alpha = 1.0 (无噪)
                 alpha_bar_t_prev = torch.tensor(1.0).to(self.device).float()
             else:
                 prev_t = timesteps[i+1]
@@ -107,8 +104,6 @@ class DiTImangenetTrainer:
         latent_size = (in_channels, input_size, input_size)
 
         z = self.sample_ddim(n_samples, labels, latent_size, num_inference_steps=50)
-        
-        # 解码 VAE (保持精度)
         x_recon = self.vae.decode(z.to(self.dtype) / 0.18215).sample.float()
         x_recon = torch.clamp((x_recon + 1.0) / 2.0, 0.0, 1.0)
         
@@ -136,14 +131,12 @@ class DiTImangenetTrainer:
         for i, (real_imgs, _) in enumerate(self.loader):
             if i >= num_gen_batches: break
             real_imgs = real_imgs.to(self.device)
-            # [-1, 1] -> [0, 1]
             real_imgs = ((real_imgs + 1.0) / 2.0).clamp(0.0, 1.0)
-            # Float32 -> UInt8 [0, 255] for TorchMetrics
             real_imgs_uint8 = (real_imgs * 255.0).to(torch.uint8)
             self.fid_metric.update(real_imgs_uint8, real=True)
         
         # 2. Fake Images
-        for _ in range(num_gen_batches):
+        for i in range(num_gen_batches):
             n_samples = self.config.batch_size
             labels = torch.randint(0, 1000, (n_samples,), device=self.device)
             
@@ -155,8 +148,16 @@ class DiTImangenetTrainer:
             
             fake_imgs = self.vae.decode(z.to(self.dtype) / 0.18215).sample.float()
             fake_imgs = ((fake_imgs + 1.0) / 2.0).clamp(0.0, 1.0)
-            fake_imgs_uint8 = (fake_imgs * 255.0).to(torch.uint8)
             
+            # --- 新增: 在计算 FID 时直接保存图片 (Rank 0, First Batch) ---
+            if i == 0 and self.config.local_rank == 0:
+                # 保存前 8 张生成的图片
+                save_path = os.path.join(self.config.results_dir, f"fid_samples_epoch_{epoch}.png")
+                save_image(fake_imgs[:8], save_path, nrow=4)
+                print(f"[Visual] Saved FID evaluation samples to {save_path}")
+            # --------------------------------------------------------
+
+            fake_imgs_uint8 = (fake_imgs * 255.0).to(torch.uint8)
             self.fid_metric.update(fake_imgs_uint8, real=False)
             
         fid_score = self.fid_metric.compute()
@@ -190,7 +191,6 @@ class DiTImangenetTrainer:
                 
             t = torch.randint(0, self.diffusion.num_timesteps, (images.shape[0],), device=self.device)
             
-            # 使用 Config 控制的 AMP
             with torch.amp.autocast('cuda', dtype=self.dtype) if self.use_amp else nullcontext():
                 loss = self.diffusion.p_losses(self.model, latents, t, labels)
                 
@@ -204,11 +204,20 @@ class DiTImangenetTrainer:
                 start_time = time()
 
         if self.config.local_rank == 0:
+            # 如果配置了 FID 评估间隔，则不在此处单独调用 visualize，避免重复生成
+            # 如果不跑 FID，则保留轻量级 visualize
             viz_interval = getattr(self.config, 'log_interval', 1)
-            if epoch % viz_interval == 0:
+            # 只有当本 epoch 不会跑 evaluate_fid 时才跑 visualize
+            if epoch % viz_interval == 0 and not (epoch > 0 and epoch % 5 == 0):
                 self.visualize(epoch)
-            if epoch > 0 and epoch % 5 == 0:
-                self.evaluate_fid(epoch, num_gen_batches=15) 
+            
+            # FID 评估频率
+            # 确保 evaluate_fid 被调用（注意 evaluate_fid 内部有 barrier，所以所有 rank 都要调）
+        
+        # 修正逻辑：所有 rank 必须同步决定是否跑 FID
+        if epoch > 0 and epoch % 5 == 0:
+             # num_gen_batches 可以设大一点，因为是分布式生成
+            self.evaluate_fid(epoch, num_gen_batches=15) 
 
     def save_checkpoint(self, epoch):
         if self.config.local_rank == 0:
