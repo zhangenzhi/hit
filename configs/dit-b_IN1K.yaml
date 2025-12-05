@@ -1,21 +1,16 @@
-# DiT-B/2 ImageNet 256x256 Configuration
-# 复现配置参考: DiT-B (12 layers, 768 hidden, 12 heads)
+# DiT-B/2 ImageNet Configuration (Latent Mode Optimized)
 
 data:
-  # 请修改为实际的 ImageNet 路径
-  data_path: "/work/c30778/dataset/imagenet/"
+  # 【关键修改 1】指向预处理好的 Latent 目录
+  # 之前是: /work/c30778/dataset/imagenet/
+  data_path: "/work/c30778/imagenet_latent/"
   image_size: 256
-  num_workers: 32
+  num_workers: 16  # Latent 读取很快，可以适当增加 worker
 
 model:
   # DiT-B Config
-  input_size: 32      # 256 / 8 (VAE downsample factor)
-  
-  # Patch Size 选择:
-  # p=2 (DiT-B/2): 最佳生成质量 (SOTA复现首选)
-  # p=4 (DiT-B/4): 速度更快，对应你表格中的 Gflops=5.6
-  patch_size: 2       
-  
+  input_size: 32      # 256 / 8
+  patch_size: 2       # DiT-B/2
   in_channels: 4
   hidden_size: 768    # DiT-B hidden size
   depth: 12           # DiT-B layers
@@ -27,18 +22,21 @@ diffusion:
   num_timesteps: 1000
   beta_start: 0.0001
   beta_end: 0.02
+  schedule: "cosine"  # 强烈建议使用我们添加的 Cosine Schedule
 
 training:
   epochs: 100
-  batch_size: 128      # DiT-B 较小，H100 上可以适当增大 Batch Size (例如 64 或 128)
-  lr: 0.0001          # 1e-4
-  results_dir: "./results/dit_b_2"
-  use_amp: True       # 使用 BF16/FP16 混合精度
-  seed: 42
-  log_interval: 50    # 日志打印频率
-  save_interval: 1    # Checkpoint 保存频率 (Epochs)
   
-  # --- 调试与快速测试配置 ---
-  # 设置每个 Epoch 的最大训练步数。
-  # 调试时设为 100 或 1000，正式训练时请注释掉或设为 null
-  max_train_steps: 500
+  # 【关键修改 2】增大 Batch Size
+  # 以前跑 Pixel 时可能只能开 32-64，现在 Latent 模式下 H100 可以轻松跑 128-256
+  batch_size: 256     
+  
+  lr: 0.0001          # 1e-4
+  results_dir: "./results/dit_b_2_latent"
+  use_amp: True       # 混合精度
+  seed: 42
+  log_interval: 50
+  save_interval: 1
+  
+  # 调试参数 (正式训练请注释掉或设为 null)
+  # max_train_steps: 100

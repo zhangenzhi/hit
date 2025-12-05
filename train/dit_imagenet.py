@@ -130,13 +130,6 @@ class DiTImangenetTrainer:
         self.model.eval()
         self.fid_metric.reset()
 
-<<<<<<< Updated upstream
-        # 1. Real Images
-        for i, (real_imgs, _) in enumerate(self.loader):
-            if i >= num_gen_batches: break
-            real_imgs = real_imgs.to(self.device)
-            real_imgs = ((real_imgs + 1.0) / 2.0).clamp(0.0, 1.0)
-=======
         # 1. Real Images (支持 Pixel 或 Latent)
         for i, (real_imgs, _) in enumerate(self.loader):
             if i >= num_gen_batches: break
@@ -154,7 +147,6 @@ class DiTImangenetTrainer:
             # [-1, 1] -> [0, 1]
             real_imgs = ((real_imgs + 1.0) / 2.0).clamp(0.0, 1.0)
             # Float32 -> UInt8 [0, 255] for TorchMetrics
->>>>>>> Stashed changes
             real_imgs_uint8 = (real_imgs * 255.0).to(torch.uint8)
             self.fid_metric.update(real_imgs_uint8, real=True)
         
