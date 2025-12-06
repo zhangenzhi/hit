@@ -33,10 +33,20 @@ class DiTImangenetTrainer:
         if config.local_rank == 0:
             print(f"Training with AMP: {self.use_amp}, Dtype: {self.dtype}")
         
+        # 编译模型以加速 (H100 建议开启)
+        try:
+            self.model = torch.compile(self.model, mode="default")
+            if config.local_rank == 0:
+                print("Model compiled with torch.compile")
+        except Exception as e:
+            print(f"Warning: torch.compile failed: {e}")
+
         self.fid_metric = None
         try:
             from torchmetrics.image.fid import FrechetInceptionDistance
-            self.fid_metric = FrechetInceptionDistance(feature=2048, reset_real_features=False).to(self.device)
+            # 【修复 1】移除 reset_real_features=False，或设为 True
+            # 这样每次调用 .reset() 都会清空 Real 和 Fake 的统计量，防止无限累积
+            self.fid_metric = FrechetInceptionDistance(feature=2048, reset_real_features=True).to(self.device)
             if self.config.local_rank == 0:
                 print("FID metric initialized successfully (Distributed Mode).")
         except ImportError:
@@ -105,8 +115,7 @@ class DiTImangenetTrainer:
 
         z = self.sample_ddim(n_samples, labels, latent_size, num_inference_steps=50)
         
-        # 修复: 移除 .to(self.dtype)
-        # sample_ddim 返回的是 float32, VAE 也是 float32, 直接除以缩放因子即可
+        # 移除 .to(self.dtype)
         x_recon = self.vae.decode(z / 0.18215).sample.float()
         x_recon = torch.clamp((x_recon + 1.0) / 2.0, 0.0, 1.0)
         
@@ -128,25 +137,19 @@ class DiTImangenetTrainer:
             print(f"[FID] Starting distributed evaluation for epoch {epoch}...")
         
         self.model.eval()
-        self.fid_metric.reset()
+        self.fid_metric.reset() # 现在 reset 会正确清空 Real 和 Fake
 
-        # 1. Real Images (支持 Pixel 或 Latent)
+        # 1. Real Images
         for i, (real_imgs, _) in enumerate(self.loader):
             if i >= num_gen_batches: break
             real_imgs = real_imgs.to(self.device)
             
-            # --- 新增: 检查输入是否为 Latent (4通道) ---
             if real_imgs.shape[1] == 4:
-                # 如果是 Latent，需要解码回 Pixel 才能计算 FID
-                # 假设输入的 Latent 是未缩放的 (unscaled)，所以需要 / 0.18215
-                # 如果你存的时候已经缩放了，这里请去掉除法
+                # Latent -> Pixel
                 real_imgs = self.vae.decode(real_imgs / 0.18215).sample
                 real_imgs = real_imgs.clamp(-1, 1)
-            # ------------------------------------------
 
-            # [-1, 1] -> [0, 1]
             real_imgs = ((real_imgs + 1.0) / 2.0).clamp(0.0, 1.0)
-            # Float32 -> UInt8 [0, 255] for TorchMetrics
             real_imgs_uint8 = (real_imgs * 255.0).to(torch.uint8)
             self.fid_metric.update(real_imgs_uint8, real=True)
         
@@ -161,11 +164,9 @@ class DiTImangenetTrainer:
             
             z = self.sample_ddim(n_samples, labels, latent_size, num_inference_steps=50)
             
-            # 修复: 移除 .to(self.dtype)，保持 float32 传入 VAE
             fake_imgs = self.vae.decode(z / 0.18215).sample.float()
             fake_imgs = ((fake_imgs + 1.0) / 2.0).clamp(0.0, 1.0)
             
-            # 在计算 FID 时直接保存图片 (Rank 0, First Batch)
             if i == 0 and self.config.local_rank == 0:
                 save_path = os.path.join(self.config.results_dir, f"fid_samples_epoch_{epoch}.png")
                 save_image(fake_imgs[:8], save_path, nrow=4)
@@ -182,6 +183,10 @@ class DiTImangenetTrainer:
                 f.write(f"Epoch {epoch}, FID: {fid_score.item():.4f}\n")
 
         self.model.train()
+        
+        # 【修复 2】清理显存，防止 VAE/Inception 残留占用训练内存
+        torch.cuda.empty_cache()
+        
         if self.config.use_ddp:
             dist.barrier()
 
@@ -199,17 +204,12 @@ class DiTImangenetTrainer:
             images = images.to(self.device)
             labels = labels.to(self.device)
             
-            # --- 自动判断输入类型: Pixel vs Latent ---
             if images.shape[1] == 3:
-                # 3通道 -> Pixel Space，需要 VAE 编码 (On-the-fly)
                 with torch.no_grad():
                     posterior = self.vae.encode(images).latent_dist
                     latents = posterior.sample().mul_(0.18215)
             else:
-                # 4通道 -> Latent Space (Pre-computed)
-                # 假设预处理保存的是原始 sample (unscaled)，所以需要乘系数
                 latents = images * 0.18215
-            # ---------------------------------------
                 
             t = torch.randint(0, self.diffusion.num_timesteps, (images.shape[0],), device=self.device)
             
@@ -227,13 +227,10 @@ class DiTImangenetTrainer:
 
         if self.config.local_rank == 0:
             viz_interval = getattr(self.config, 'log_interval', 1)
-            # 只有当本 epoch 不会跑 evaluate_fid 时才跑 visualize
             if epoch % viz_interval == 0 and not (epoch > 0 and epoch % 5 == 0):
                 self.visualize(epoch)
             
-        # 修正逻辑：所有 rank 必须同步决定是否跑 FID
         if epoch > 0 and epoch % 5 == 0:
-             # num_gen_batches 可以设大一点，因为是分布式生成
             self.evaluate_fid(epoch, num_gen_batches=15) 
 
     def save_checkpoint(self, epoch):
