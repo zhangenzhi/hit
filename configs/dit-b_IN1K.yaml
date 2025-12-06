@@ -25,7 +25,7 @@ diffusion:
   schedule: "cosine"  # 强烈建议使用我们添加的 Cosine Schedule
 
 training:
-  epochs: 100
+  epochs: 800
   
   # 【关键修改 2】增大 Batch Size
   # 以前跑 Pixel 时可能只能开 32-64，现在 Latent 模式下 H100 可以轻松跑 128-256
