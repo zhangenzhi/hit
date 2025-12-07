@@ -17,27 +17,30 @@ def main():
     parser.add_argument("--batch_size", type=int, default=8, help="Number of *original images* per batch per GPU.")
     parser.add_argument("--num_crops", type=int, default=10, help="Number of RandomResizedCrop augmentations per image")
     parser.add_argument("--num_workers", type=int, default=8, help="Workers per GPU")
-    parser.add_argument("--vae_batch_size", type=int, default=32, help="Mini-batch size for VAE inference to avoid OOM. (Default: 32)")
     args = parser.parse_args()
 
-    # --- 1. DDP 初始化 ---
-    # 检查是否通过 torchrun 启动
+    # --- 1. DDP 初始化 (关键：确保 Rank 和 Device 正确绑定) ---
     if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
         dist.init_process_group(backend="nccl")
         rank = int(os.environ["RANK"])
         world_size = int(os.environ["WORLD_SIZE"])
         local_rank = int(os.environ["LOCAL_RANK"])
+        
+        # 强制设置当前进程可见的 GPU
         torch.cuda.set_device(local_rank)
         device = torch.device(f"cuda:{local_rank}")
         is_main_process = (rank == 0)
+        
+        # [Debug] 打印设备绑定信息，确保没有全部挤在 cuda:0
+        print(f"[Init] Global Rank {rank} | Local Rank {local_rank} | Device: {torch.cuda.current_device()} | Name: {torch.cuda.get_device_name(device)}")
     else:
-        # 单卡回退模式
+        # 单卡模式
         rank = 0
         world_size = 1
         local_rank = 0
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         is_main_process = True
-        print("Running in single-process mode (Not DDP).")
+        print(f"[Init] Single Process Mode | Device: {device}")
 
     if is_main_process:
         print(f"Global Rank 0: Initialized DDP with world_size={world_size}")
@@ -46,7 +49,7 @@ def main():
     if is_main_process:
         print(f"Loading VAE to {device}...")
     
-    # 开启 tf32 以在 Ampere/Hopper 架构上加速 FP32 计算
+    # 开启 tf32 加速 FP32 计算
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
 
@@ -68,18 +71,13 @@ def main():
     valid_exts = ('.jpg', '.jpeg', '.png', '.bmp', '.webp', '.tiff')
     image_paths = []
     
-    # 注意：在拥有数百万文件的 ImageNet 上，os.walk 可能较慢。
-    # 理想情况下只在 rank 0 扫描然后广播，但为了代码简单且文件系统通常能扛住 4 个并发读取，这里每个进程独立扫描。
-    # 关键：必须排序，确保所有进程看到的文件列表顺序完全一致！
     for root, _, files in os.walk(args.data_path):
         for fname in files:
             if fname.lower().endswith(valid_exts):
                 src_path = os.path.join(root, fname)
                 rel_path = os.path.relpath(src_path, args.data_path)
-                
                 base_name = os.path.splitext(rel_path)[0]
                 dst_base = os.path.join(args.save_path, base_name)
-                
                 image_paths.append((src_path, dst_base))
     
     # 【核心】排序以保证确定性
@@ -89,7 +87,6 @@ def main():
         print(f"Found {len(image_paths)} total images.")
     
     # 【核心】根据 rank 进行切片分发
-    # 比如 4 卡：Rank 0 处理 0, 4, 8...; Rank 1 处理 1, 5, 9...
     my_paths = image_paths[rank::world_size]
     
     if is_main_process:
@@ -112,7 +109,7 @@ def main():
                 crops = []
                 for _ in range(self.num_crops):
                     crops.append(self.transform(img))
-                img_tensor = torch.stack(crops)
+                img_tensor = torch.stack(crops) # (10, 3, 256, 256)
                 return img_tensor, dst_base
             except Exception as e:
                 print(f"Rank {rank} Error loading {src}: {e}")
@@ -131,42 +128,27 @@ def main():
 
     # --- 6. 编码循环 ---
     if is_main_process:
-        print(f"Start encoding with DDP... (VAE mini-batch size: {args.vae_batch_size})")
+        print(f"Start encoding with DDP... (Batch Size per GPU: {args.batch_size} imgs * {args.num_crops} crops = {args.batch_size * args.num_crops} inputs)")
     
-    # 只有 Rank 0 显示进度条，避免刷屏
     iterator = tqdm(loader, desc=f"GPU {rank}", disable=not is_main_process)
     
     with torch.no_grad():
         for batch_imgs, batch_dst_bases in iterator:
-            # batch_imgs: (B, num_crops, 3, H, W)
-            # 例如: B=8, num_crops=10 -> 总共 80 张图
+            # batch_imgs: (B, num_crops, 3, H, W) -> (8, 10, 3, 256, 256)
             B, N, C, H, W = batch_imgs.shape
             
-            # 先 Flatten 到 (B*N, C, H, W)，保持在 CPU 上
-            flat_imgs = batch_imgs.view(-1, C, H, W)
-            total_imgs = flat_imgs.shape[0]
+            # 直接 Flatten 并移入 GPU。对于 H100 来说，80 张 256x256 的图是小菜一碟。
+            flat_imgs = batch_imgs.view(-1, C, H, W).to(device, non_blocking=True)
             
-            latents_list = []
+            # 混合精度推理
+            with torch.amp.autocast('cuda', dtype=torch.float16):
+                dist_post = vae.encode(flat_imgs).latent_dist
+                latents = dist_post.sample() # (80, 4, 32, 32)
             
-            # 【核心修改】主动切片处理，避免一次性送入导致 OOM
-            # 每次只处理 vae_batch_size 张图
-            for i in range(0, total_imgs, args.vae_batch_size):
-                # 1. 切片并在此时才移动到 GPU (non_blocking 加速传输)
-                # 这样 GPU 显存中只会有 vae_batch_size 张图，而不是 80 张
-                img_chunk = flat_imgs[i : i + args.vae_batch_size].to(device, non_blocking=True)
-                
-                # 2. 混合精度推理
-                with torch.amp.autocast('cuda', dtype=torch.float16):
-                    dist_post = vae.encode(img_chunk).latent_dist
-                    latents_chunk = dist_post.sample()
-                
-                # 3. 立即移回 CPU，释放 GPU 显存
-                latents_list.append(latents_chunk.cpu())
+            # 移回 CPU
+            latents = latents.cpu()
             
-            # 拼接回完整 Tensor
-            latents = torch.cat(latents_list, dim=0)
-            
-            # Reshape 回 (B, N, 4, h, w) 方便按文件保存
+            # Reshape 回 (B, N, 4, h, w)
             latents = latents.view(B, N, *latents.shape[1:])
             
             # 保存逻辑
@@ -175,11 +157,9 @@ def main():
                     os.makedirs(os.path.dirname(dst_base), exist_ok=True)
                     for j in range(N):
                         save_path = f"{dst_base}_{j}.pt"
-                        # 检查文件是否已存在（可选）
-                        # if not os.path.exists(save_path):
+                        # 保存 Unscaled Latent
                         torch.save(latents[i, j].clone(), save_path)
-                except OSError as e:
-                    # 处理多进程创建目录可能的竞争条件
+                except OSError:
                     pass
 
     if is_main_process:
