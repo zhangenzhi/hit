@@ -27,12 +27,11 @@ diffusion:
 training:
   epochs: 400
   
-  # 【关键修改 2】增大 Batch Size
   # 以前跑 Pixel 时可能只能开 32-64，现在 Latent 模式下 H100 可以轻松跑 128-256
   batch_size: 256     
   
   lr: 0.0002          # 1e-4
-  results_dir: "./results/dit_b_2_latent-v3"
+  results_dir: "./results/dit_b_2_latent-v4"
   use_amp: True       # 混合精度
   seed: 42
   log_interval: 50
