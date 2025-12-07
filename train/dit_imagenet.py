@@ -70,7 +70,8 @@ class DiTImangenetTrainer:
         
         # 准备 Null Label (用于 Unconditional 生成)
         # 假设 num_classes = 1000, embedding size = 1001, null_idx = 1000
-        null_idx = self.config.model.num_classes
+        # 修复：Trainer 接收的是 flatten_config，因此属性在顶层，没有 .model 这一层
+        null_idx = getattr(self.config, 'num_classes', 1000)
         null_labels = torch.full_like(labels, null_idx, device=self.device)
 
         for i, t_step in enumerate(timesteps):
