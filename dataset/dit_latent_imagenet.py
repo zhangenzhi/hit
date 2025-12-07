@@ -22,13 +22,16 @@ def build_dit_transform(is_train, img_size):
 
     if is_train:
         transform = transforms.Compose([
-            # 【关键修复】使用 RandomResizedCrop 以获得更好的 FID
-            transforms.RandomResizedCrop(img_size, scale=(0.8, 1.0), interpolation=transforms.InterpolationMode.BICUBIC),
+            # 【关键修复】使用标准的 ImageNet RandomResizedCrop (scale=0.08-1.0)
+            # 之前的 scale=(0.8, 1.0) 过于保守，接近 CenterCrop，限制了模型学习尺度不变性，
+            # 导致 FID 在验证集（通常包含不同尺度的物体）上表现不佳。
+            transforms.RandomResizedCrop(img_size, scale=(0.08, 1.0), interpolation=transforms.InterpolationMode.BICUBIC),
             transforms.RandomHorizontalFlip(),
             transforms.ToTensor(),
             transforms.Normalize(mean=mean, std=std)
         ])
     else:
+        # 验证集保持标准的 Resize + CenterCrop，这是计算 FID 的对齐标准
         transform = transforms.Compose([
             transforms.Resize(img_size, interpolation=transforms.InterpolationMode.BICUBIC),
             transforms.CenterCrop(img_size),
@@ -95,7 +98,8 @@ def build_dit_dataloaders(args):
     # 3. 构建 Dataset
     if is_latent:
         # Latent 模式: 使用 LatentFolder，无 Transform
-        # 注意: 离线 Latent 通常是固定 Crop 的，这会影响 FID
+        # 注意: 如果需要刷 SOTA FID，离线 Latent 必须在生成时就应用 RandomResizedCrop
+        # 否则建议使用 Pixel 模式进行训练
         train_dataset = LatentFolder(train_root)
         val_dataset = LatentFolder(val_root) if (val_root and os.path.exists(val_root)) else None
     else:
