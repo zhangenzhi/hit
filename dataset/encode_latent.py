@@ -44,7 +44,7 @@ def main():
     parser.add_argument("--data_path", type=str, required=True, help="Path to raw ImageNet train directory")
     parser.add_argument("--save_path", type=str, required=True, help="Path to save latents")
     parser.add_argument("--image_size", type=int, default=256)
-    parser.add_argument("--batch_size", type=int, default=64, help="Number of *original images* per batch per GPU.")
+    parser.add_argument("--batch_size", type=int, default=32, help="Number of *original images* per batch per GPU.")
     parser.add_argument("--num_crops", type=int, default=10, help="Number of RandomResizedCrop augmentations per image")
     parser.add_argument("--num_workers", type=int, default=32, help="Workers per GPU")
     args = parser.parse_args()
