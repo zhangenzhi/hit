@@ -43,10 +43,10 @@ def main():
     parser.add_argument("--save_path", type=str, required=True, help="Path to save latents")
     parser.add_argument("--image_size", type=int, default=256)
     # [优化] 默认 Batch 增大到 32。对于 10 crops，实际 batch 是 320。H100 显存足够。
-    parser.add_argument("--batch_size", type=int, default=32, help="Number of *original images* per batch per GPU. (Actual input to VAE = batch_size * num_crops)")
+    parser.add_argument("--batch_size", type=int, default=40, help="Number of *original images* per batch per GPU. (Actual input to VAE = batch_size * num_crops)")
     parser.add_argument("--num_crops", type=int, default=10, help="Number of RandomResizedCrop augmentations per image")
     # [优化] 默认 Worker 增大到 16，充分利用 H100 配套的高性能 CPU。
-    parser.add_argument("--num_workers", type=int, default=16, help="Workers per GPU")
+    parser.add_argument("--num_workers", type=int, default=32, help="Workers per GPU")
     args = parser.parse_args()
 
     # --- 1. DDP 初始化 ---
