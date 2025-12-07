@@ -33,7 +33,6 @@ class DiTImangenetTrainer:
         if config.local_rank == 0:
             print(f"Training with AMP: {self.use_amp}, Dtype: {self.dtype}")
         
-        # 编译模型以加速 (H100 建议开启)
         try:
             self.model = torch.compile(self.model, mode="default")
             if config.local_rank == 0:
@@ -44,7 +43,6 @@ class DiTImangenetTrainer:
         self.fid_metric = None
         try:
             from torchmetrics.image.fid import FrechetInceptionDistance
-            # 【修复 1】移除 reset_real_features=False，或设为 True
             self.fid_metric = FrechetInceptionDistance(feature=2048, reset_real_features=True).to(self.device)
             if self.config.local_rank == 0:
                 print("FID metric initialized successfully (Distributed Mode).")
@@ -55,78 +53,64 @@ class DiTImangenetTrainer:
     @torch.no_grad()
     def sample_ddim(self, n, labels, size, num_inference_steps=50, eta=0.0, cfg_scale=4.0):
         """
-        DDIM 快速采样 (支持 CFG)
+        DDIM 快速采样 (强制 FP32 计算)
         """
         self.model.eval()
-        # 获取原始模型以绕过 DDP 包装（如果存在）
-        # 注意：如果使用了 torch.compile，可能还有一层 _OrigMod
         raw_model = self.model.module if isinstance(self.model, DDP) else self.model
         
-        # 1. 构造时间步
         step_ratio = self.diffusion.num_timesteps // num_inference_steps
         timesteps = (np.arange(0, num_inference_steps) * step_ratio).round()[::-1].copy().astype(int)
         
         x = torch.randn(n, *size).to(self.device)
         
-        # 准备 Null Label (用于 Unconditional 生成)
-        # 假设 num_classes = 1000, embedding size = 1001, null_idx = 1000
-        # 修复：Trainer 接收的是 flatten_config，因此属性在顶层，没有 .model 这一层
         null_idx = getattr(self.config, 'num_classes', 1000)
         null_labels = torch.full_like(labels, null_idx, device=self.device)
 
         for i, t_step in enumerate(timesteps):
-            # 构造当前时间步
             t = torch.full((n,), t_step, device=self.device, dtype=torch.long)
             
-            # --- CFG 处理逻辑 ---
+            # --- CFG ---
             if cfg_scale > 1.0:
-                # 拼接输入: [Cond, Uncond]
                 x_in = torch.cat([x, x])
                 t_in = torch.cat([t, t])
                 y_in = torch.cat([labels, null_labels])
             else:
                 x_in, t_in, y_in = x, t, labels
 
-            # 2.1 预测噪声
             with torch.amp.autocast('cuda', dtype=self.dtype) if self.use_amp else nullcontext():
                 model_output = raw_model(x_in, t_in, y_in)
             
-            # 转换为 float32 保证精度
             model_output = model_output.float()
             
-            # 2.1.1 拆分 Epsilon 和 Variance (如果 learn_sigma=True)
-            # DiT 输出通道是 in_channels * 2 (eps, var)
-            # 我们只关心 eps 用于采样均值，var 用于方差 (DDIM eta=0 时通常不重要，除非用它来加噪)
+            # 切分 epsilon (CFG)
+            # 这里的切分逻辑现在是正确的，基于 input channels
             in_channels = size[0]
             eps = model_output[:, :in_channels]
-            # rest = model_output[:, in_channels:] # 方差部分，DDIM eta=0 时可以忽略
-
-            # 2.1.2 应用 CFG
+            
             if cfg_scale > 1.0:
                 cond_eps, uncond_eps = eps.chunk(2)
                 eps = uncond_eps + cfg_scale * (cond_eps - uncond_eps)
             
-            # 2.2 参数获取
-            alpha_bar_t = self.diffusion.alphas_cumprod[t_step].to(self.device).float()
-            
+            # 获取 alpha 参数
+            alpha_bar_t = self.diffusion.alphas_cumprod[t_step]
             if i == len(timesteps) - 1:
                 alpha_bar_t_prev = torch.tensor(1.0).to(self.device).float()
             else:
                 prev_t = timesteps[i+1]
-                alpha_bar_t_prev = self.diffusion.alphas_cumprod[prev_t].to(self.device).float()
+                alpha_bar_t_prev = self.diffusion.alphas_cumprod[prev_t]
             
-            # 2.3 更新公式 (DDIM)
-            # x_{t-1} = sqrt(alpha_prev) * pred_x0 + dir_xt + sigma * noise
-            
+            # DDIM 更新
             sigma_t = eta * torch.sqrt((1 - alpha_bar_t_prev) / (1 - alpha_bar_t) * (1 - alpha_bar_t / alpha_bar_t_prev))
             
-            # pred_x0
+            # 预测 x0
             pred_x0 = (x - torch.sqrt(1 - alpha_bar_t) * eps) / torch.sqrt(alpha_bar_t)
             
-            # direction to x_t
-            dir_xt = torch.sqrt(1 - alpha_bar_t_prev - sigma_t**2) * eps
+            # 【关键修复 #3】: Clamp x0
+            # 这一步对于防止图像颜色过饱和和伪影至关重要
+            pred_x0 = pred_x0.clamp(-1, 1)
             
-            # random noise (eta=0 时为 0)
+            # 指向 xt 方向
+            dir_xt = torch.sqrt(1 - alpha_bar_t_prev - sigma_t**2) * eps
             noise = sigma_t * torch.randn_like(x)
             
             x = torch.sqrt(alpha_bar_t_prev) * pred_x0 + dir_xt + noise
@@ -146,10 +130,8 @@ class DiTImangenetTrainer:
         input_size = getattr(self.config, 'input_size', 32)
         latent_size = (in_channels, input_size, input_size)
 
-        # 可视化时开启 CFG，通常设为 4.0 效果较好
         z = self.sample_ddim(n_samples, labels, latent_size, num_inference_steps=50, cfg_scale=4.0)
         
-        # 移除 .to(self.dtype)
         x_recon = self.vae.decode(z / 0.18215).sample.float()
         x_recon = torch.clamp((x_recon + 1.0) / 2.0, 0.0, 1.0)
         
@@ -171,7 +153,7 @@ class DiTImangenetTrainer:
             print(f"[FID] Starting distributed evaluation for epoch {epoch}...")
         
         self.model.eval()
-        self.fid_metric.reset() # 每次评估前重置
+        self.fid_metric.reset()
 
         # 1. Real Images
         for i, (real_imgs, _) in enumerate(self.loader):
@@ -179,7 +161,6 @@ class DiTImangenetTrainer:
             real_imgs = real_imgs.to(self.device)
             
             if real_imgs.shape[1] == 4:
-                # Latent -> Pixel
                 real_imgs = self.vae.decode(real_imgs / 0.18215).sample
                 real_imgs = real_imgs.clamp(-1, 1)
 
@@ -196,8 +177,6 @@ class DiTImangenetTrainer:
             input_size = getattr(self.config, 'input_size', 32)
             latent_size = (in_channels, input_size, input_size)
             
-            # 使用 CFG=1.5 进行 FID 评估 (DiT 论文通常使用 1.5 - 2.0 评估 FID-50k)
-            # CFG 过高会降低多样性，导致 FID 变差；过低则质量不够
             z = self.sample_ddim(n_samples, labels, latent_size, num_inference_steps=50, cfg_scale=1.5)
             
             fake_imgs = self.vae.decode(z / 0.18215).sample.float()
@@ -219,9 +198,7 @@ class DiTImangenetTrainer:
                 f.write(f"Epoch {epoch}, FID: {fid_score.item():.4f}\n")
 
         self.model.train()
-        
         torch.cuda.empty_cache()
-        
         if self.config.use_ddp:
             dist.barrier()
 
@@ -249,7 +226,10 @@ class DiTImangenetTrainer:
             t = torch.randint(0, self.diffusion.num_timesteps, (images.shape[0],), device=self.device)
             
             with torch.amp.autocast('cuda', dtype=self.dtype) if self.use_amp else nullcontext():
-                loss = self.diffusion.p_losses(self.model, latents, t, labels)
+                # 【关键修复 #5】: 使用 diffusion.training_losses 获取完整 Loss
+                # 包含 MSE (Noise) + VB (Variance)
+                loss_dict = self.diffusion.training_losses(self.model, latents, t, model_kwargs=dict(y=labels))
+                loss = loss_dict["loss"].mean()
                 
             self.optimizer.zero_grad()
             loss.backward()

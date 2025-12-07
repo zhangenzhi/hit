@@ -1,13 +1,29 @@
-import torch
-import numpy as np
 import math
+import numpy as np
+import torch as th
+import enum
+
+def mean_flat(tensor):
+    return tensor.mean(dim=list(range(1, len(tensor.shape))))
+
+class ModelMeanType(enum.Enum):
+    PREVIOUS_X = enum.auto()
+    START_X = enum.auto()
+    EPSILON = enum.auto()
+
+class ModelVarType(enum.Enum):
+    LEARNED = enum.auto()
+    FIXED_SMALL = enum.auto()
+    FIXED_LARGE = enum.auto()
+    LEARNED_RANGE = enum.auto()
+
+class LossType(enum.Enum):
+    MSE = enum.auto()
+    RESCALED_MSE = enum.auto()
+    KL = enum.auto()
+    RESCALED_KL = enum.auto()
 
 def betas_for_alpha_bar(num_diffusion_timesteps, alpha_bar, max_beta=0.999):
-    """
-    创建一个 beta schedule，该 schedule 离散化了给定的 alpha_t_bar 函数，
-    该函数定义了从 t = [0,1] 随时间变化的 (1-beta) 的累积乘积。
-    来源于 OpenAI Improved Diffusion。
-    """
     betas = []
     for i in range(num_diffusion_timesteps):
         t1 = i / num_diffusion_timesteps
@@ -20,13 +36,14 @@ class GaussianDiffusion:
         self.num_timesteps = num_timesteps
         self.device = device
         
-        # 1. 计算 Betas (使用 float64 避免精度损失)
+        # 默认配置适配 DiT
+        self.model_mean_type = ModelMeanType.EPSILON
+        self.model_var_type = ModelVarType.LEARNED_RANGE # DiT 使用 learned_range
+        self.loss_type = LossType.MSE # 实际上是 MSE + VLB (Hybrid)
+
         if schedule == "linear":
-            # 经典的 Linear Schedule
             betas = np.linspace(beta_start, beta_end, num_timesteps, dtype=np.float64)
         elif schedule == "cosine":
-            # OpenAI 改进的 Cosine Schedule
-            # 解决 "300步后全是噪声" 的问题，信噪比下降更平滑
             betas = betas_for_alpha_bar(
                 num_timesteps,
                 lambda t: math.cos((t + 0.008) / 1.008 * math.pi / 2) ** 2,
@@ -34,35 +51,198 @@ class GaussianDiffusion:
         else:
             raise NotImplementedError(f"Unknown schedule: {schedule}")
 
-        self.betas = torch.from_numpy(betas).to(device=device, dtype=torch.float32)
-        
-        # 2. 计算 Alphas 及其累乘 (使用 numpy float64)
+        self.betas = betas
+        assert len(betas.shape) == 1, "betas must be 1-D"
+        assert (betas > 0).all() and (betas <= 1).all()
+
+        self.num_timesteps = int(betas.shape[0])
+
         alphas = 1.0 - betas
-        alphas_cumprod = np.cumprod(alphas, axis=0)
+        self.alphas_cumprod = np.cumprod(alphas, axis=0)
+        self.alphas_cumprod_prev = np.append(1.0, self.alphas_cumprod[:-1])
+        self.alphas_cumprod_next = np.append(self.alphas_cumprod[1:], 0.0)
+
+        # calculations for diffusion q(x_t | x_{t-1}) and others
+        self.sqrt_alphas_cumprod = np.sqrt(self.alphas_cumprod)
+        self.sqrt_one_minus_alphas_cumprod = np.sqrt(1.0 - self.alphas_cumprod)
+        self.log_one_minus_alphas_cumprod = np.log(1.0 - self.alphas_cumprod)
+        self.sqrt_recip_alphas_cumprod = np.sqrt(1.0 / self.alphas_cumprod)
+        self.sqrt_recipm1_alphas_cumprod = np.sqrt(1.0 / self.alphas_cumprod - 1)
+
+        # calculations for posterior q(x_{t-1} | x_t, x_0)
+        self.posterior_variance = (
+            betas * (1.0 - self.alphas_cumprod_prev) / (1.0 - self.alphas_cumprod)
+        )
+        self.posterior_log_variance_clipped = np.log(
+            np.append(self.posterior_variance[1], self.posterior_variance[1:])
+        ) if len(self.posterior_variance) > 1 else np.array([])
+
+        self.posterior_mean_coef1 = (
+            betas * np.sqrt(self.alphas_cumprod_prev) / (1.0 - self.alphas_cumprod)
+        )
+        self.posterior_mean_coef2 = (
+            (1.0 - self.alphas_cumprod_prev) * np.sqrt(alphas) / (1.0 - self.alphas_cumprod)
+        )
         
-        # 3. 转回 Tensor (Float32)
-        self.alphas = torch.from_numpy(alphas).to(device=device, dtype=torch.float32)
-        self.alphas_cumprod = torch.from_numpy(alphas_cumprod).to(device=device, dtype=torch.float32)
-        
-        # 4. 预计算常用系数
-        self.sqrt_alphas_cumprod = torch.sqrt(self.alphas_cumprod)
-        self.sqrt_one_minus_alphas_cumprod = torch.sqrt(1.0 - self.alphas_cumprod)
+        # 转换所有 numpy 数组为 torch tensor
+        for k, v in self.__dict__.items():
+            if isinstance(v, np.ndarray):
+                setattr(self, k, th.from_numpy(v).to(device=device, dtype=th.float32))
 
     def q_sample(self, x_start, t, noise=None):
         if noise is None:
-            noise = torch.randn_like(x_start)
-        # 确保系数正确 reshape
-        sqrt_alpha = self.sqrt_alphas_cumprod[t].reshape(-1, 1, 1, 1)
-        sqrt_one_minus_alpha = self.sqrt_one_minus_alphas_cumprod[t].reshape(-1, 1, 1, 1)
-        return sqrt_alpha * x_start + sqrt_one_minus_alpha * noise
+            noise = th.randn_like(x_start)
+        return (
+            _extract_into_tensor(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start
+            + _extract_into_tensor(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * noise
+        )
 
-    def p_losses(self, model, x_start, t, y, noise=None):
-        if noise is None:
-            noise = torch.randn_like(x_start)
-        x_t = self.q_sample(x_start, t, noise)
-        model_output = model(x_t, t, y)
+    def _predict_xstart_from_eps(self, x_t, t, eps):
+        return (
+            _extract_into_tensor(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t
+            - _extract_into_tensor(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape) * eps
+        )
+
+    def q_posterior_mean_variance(self, x_start, x_t, t):
+        posterior_mean = (
+            _extract_into_tensor(self.posterior_mean_coef1, t, x_t.shape) * x_start
+            + _extract_into_tensor(self.posterior_mean_coef2, t, x_t.shape) * x_t
+        )
+        posterior_variance = _extract_into_tensor(self.posterior_variance, t, x_t.shape)
+        posterior_log_variance_clipped = _extract_into_tensor(
+            self.posterior_log_variance_clipped, t, x_t.shape
+        )
+        return posterior_mean, posterior_variance, posterior_log_variance_clipped
+
+    def p_mean_variance(self, model, x, t, clip_denoised=True, model_kwargs=None):
+        if model_kwargs is None:
+            model_kwargs = {}
+
+        B, C = x.shape[:2]
+        model_output = model(x, t, **model_kwargs)
+
+        # DiT output format: [epsilon, variance_factor]
+        # split output
+        if model_output.shape[1] == 2 * C:
+            model_output, model_var_values = th.split(model_output, C, dim=1)
+            min_log = _extract_into_tensor(self.posterior_log_variance_clipped, t, x.shape)
+            max_log = _extract_into_tensor(th.log(self.betas), t, x.shape)
+            # The model_var_values is [-1, 1] for [min_var, max_var].
+            frac = (model_var_values + 1) / 2
+            model_log_variance = frac * max_log + (1 - frac) * min_log
+            model_variance = th.exp(model_log_variance)
+        else:
+            # Fixed variance case
+            model_variance, model_log_variance = (
+                self.posterior_variance,
+                self.posterior_log_variance_clipped,
+            )
+            model_variance = _extract_into_tensor(model_variance, t, x.shape)
+            model_log_variance = _extract_into_tensor(model_log_variance, t, x.shape)
+
+        def process_xstart(x):
+            if clip_denoised:
+                return x.clamp(-1, 1)
+            return x
+
+        pred_xstart = process_xstart(
+            self._predict_xstart_from_eps(x_t=x, t=t, eps=model_output)
+        )
         
-        if model_output.shape[1] == 2 * x_start.shape[1]:
-            model_output, _ = model_output.chunk(2, dim=1)
+        model_mean, _, _ = self.q_posterior_mean_variance(x_start=pred_xstart, x_t=x, t=t)
+
+        return {
+            "mean": model_mean,
+            "variance": model_variance,
+            "log_variance": model_log_variance,
+            "pred_xstart": pred_xstart,
+        }
+
+    def _vb_terms_bpd(self, model, x_start, x_t, t, clip_denoised=True, model_kwargs=None):
+        true_mean, _, true_log_variance_clipped = self.q_posterior_mean_variance(
+            x_start=x_start, x_t=x_t, t=t
+        )
+        out = self.p_mean_variance(
+            model, x_t, t, clip_denoised=clip_denoised, model_kwargs=model_kwargs
+        )
+        kl = normal_kl(
+            true_mean, true_log_variance_clipped, out["mean"], out["log_variance"]
+        )
+        kl = mean_flat(kl) / np.log(2.0)
+
+        decoder_nll = -discretized_gaussian_log_likelihood(
+            x_start, means=out["mean"], log_scales=0.5 * out["log_variance"]
+        )
+        decoder_nll = mean_flat(decoder_nll) / np.log(2.0)
+        output = th.where((t == 0), decoder_nll, kl)
+        return {"output": output, "pred_xstart": out["pred_xstart"]}
+
+    def training_losses(self, model, x_start, t, model_kwargs=None, noise=None):
+        if model_kwargs is None:
+            model_kwargs = {}
+        if noise is None:
+            noise = th.randn_like(x_start)
+        x_t = self.q_sample(x_start, t, noise=noise)
+
+        terms = {}
+        model_output = model(x_t, t, **model_kwargs)
+
+        # DiT Learned Variance Logic
+        B, C = x_t.shape[:2]
+        if model_output.shape[1] == 2 * C:
+            model_output, model_var_values = th.split(model_output, C, dim=1)
+            # Learn the variance using the variational bound, but don't let
+            # it affect our mean prediction.
+            frozen_out = th.cat([model_output.detach(), model_var_values], dim=1)
             
-        return torch.nn.functional.mse_loss(model_output, noise)
+            # 计算 VLB (Variational Lower Bound) loss 用于优化方差
+            terms["vb"] = self._vb_terms_bpd(
+                model=lambda *args, r=frozen_out: r,
+                x_start=x_start,
+                x_t=x_t,
+                t=t,
+                clip_denoised=False,
+            )["output"]
+            
+            # OpenAI IDDPM 建议: VLB loss 权重设为 1/1000 以避免覆盖 MSE
+            terms["vb"] *= self.num_timesteps / 1000.0
+
+        target = noise
+        terms["mse"] = mean_flat((target - model_output) ** 2)
+        
+        if "vb" in terms:
+            terms["loss"] = terms["mse"] + terms["vb"]
+        else:
+            terms["loss"] = terms["mse"]
+
+        return terms
+
+def _extract_into_tensor(arr, timesteps, broadcast_shape):
+    res = arr[timesteps].float()
+    while len(res.shape) < len(broadcast_shape):
+        res = res[..., None]
+    return res.expand(broadcast_shape)
+
+def normal_kl(mean1, logvar1, mean2, logvar2):
+    return 0.5 * (
+        -1.0 + logvar2 - logvar1 + th.exp(logvar1 - logvar2) + ((mean1 - mean2) ** 2) * th.exp(-logvar2)
+    )
+
+def discretized_gaussian_log_likelihood(x, *, means, log_scales):
+    # Assumes data is integers [0, 255] rescaled to [-1, 1]
+    assert x.shape == means.shape == log_scales.shape
+    centered_x = x - means
+    inv_stdv = th.exp(-log_scales)
+    plus_in = inv_stdv * (centered_x + 1.0 / 255.0)
+    cdf_plus = th.sigmoid(plus_in) # approx normal cdf using sigmoid
+    min_in = inv_stdv * (centered_x - 1.0 / 255.0)
+    cdf_min = th.sigmoid(min_in)
+    log_cdf_plus = th.log(cdf_plus.clamp(min=1e-12))
+    log_one_minus_cdf_min = th.log((1.0 - cdf_min).clamp(min=1e-12))
+    cdf_delta = cdf_plus - cdf_min
+    log_probs = th.where(
+        x < -0.999,
+        log_cdf_plus,
+        th.where(x > 0.999, log_one_minus_cdf_min, th.log(cdf_delta.clamp(min=1e-12))),
+    )
+    return log_probs
