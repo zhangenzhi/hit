@@ -3,15 +3,13 @@ import torch
 from torchvision import datasets, transforms
 from torch.utils.data import DataLoader, DistributedSampler
 
-# --- 新增: LatentFolder ---
-# 用于直接加载离线预处理好的 .pt (Latent) 文件
 class LatentFolder(datasets.DatasetFolder):
     def __init__(self, root):
         super().__init__(
             root,
-            loader=torch.load,  # 直接使用 torch.load 读取 Tensor
-            extensions=('.pt',), # 只认 .pt 后缀
-            transform=None      # Latent 不需要 Resize/Crop 等视觉增强
+            loader=torch.load, 
+            extensions=('.pt',), 
+            transform=None      
         )
 
 def build_dit_transform(is_train, img_size):
@@ -24,8 +22,8 @@ def build_dit_transform(is_train, img_size):
 
     if is_train:
         transform = transforms.Compose([
-            transforms.Resize(img_size, interpolation=transforms.InterpolationMode.BICUBIC),
-            transforms.CenterCrop(img_size),
+            # 【关键修复】使用 RandomResizedCrop 以获得更好的 FID
+            transforms.RandomResizedCrop(img_size, scale=(0.8, 1.0), interpolation=transforms.InterpolationMode.BICUBIC),
             transforms.RandomHorizontalFlip(),
             transforms.ToTensor(),
             transforms.Normalize(mean=mean, std=std)
@@ -43,7 +41,6 @@ def build_dit_transform(is_train, img_size):
 def build_dit_dataloaders(args):
     """
     DiT 专用 DataLoader 构建函数。
-    【智能模式】自动检测 data_path 是原始图片目录还是预处理后的 Latent 目录。
     """
     # 获取参数
     data_dir = getattr(args, 'data_path', getattr(args, 'data_dir', None))
@@ -68,33 +65,28 @@ def build_dit_dataloaders(args):
 
     num_workers = getattr(args, 'num_workers', 4)
 
-    # 安全获取 rank 用于打印日志
     rank = int(os.environ.get('RANK', 0))
     
     # 1. 路径检查
     train_root = os.path.join(data_dir, 'train')
     val_root = os.path.join(data_dir, 'val')
     
-    # 兼容扁平结构 (如果不包含 train/val 子目录，直接视 data_dir 为 train 目录)
     if not os.path.exists(train_root):
         train_root = data_dir
         val_root = None 
 
-    # 2. 【核心逻辑】自动检测数据类型 (Pixel vs Latent)
-    # 检查 train_root 下第一个子文件夹里的第一个文件扩展名
+    # 2. 自动检测数据类型 (Pixel vs Latent)
     is_latent = False
     try:
-        # 扫描第一个类别文件夹
         with os.scandir(train_root) as it:
             first_entry = next(it)
             if first_entry.is_dir():
-                # 扫描该类别下的第一个文件
                 with os.scandir(first_entry.path) as it_files:
                     first_file = next(it_files)
                     if first_file.name.endswith('.pt'):
                         is_latent = True
     except (StopIteration, FileNotFoundError):
-        pass # 空目录或路径错误，留给 Dataset 初始化时报错
+        pass 
 
     if rank == 0:
         mode_str = "Latent (.pt) [Fast Mode]" if is_latent else "Pixel (Image) [Standard Mode]"
@@ -103,10 +95,11 @@ def build_dit_dataloaders(args):
     # 3. 构建 Dataset
     if is_latent:
         # Latent 模式: 使用 LatentFolder，无 Transform
+        # 注意: 离线 Latent 通常是固定 Crop 的，这会影响 FID
         train_dataset = LatentFolder(train_root)
         val_dataset = LatentFolder(val_root) if (val_root and os.path.exists(val_root)) else None
     else:
-        # Pixel 模式: 使用 ImageFolder，带 Resize/Normalize
+        # Pixel 模式: 使用 ImageFolder，带 RandomResizedCrop
         train_transform = build_dit_transform(is_train=True, img_size=img_size)
         val_transform = build_dit_transform(is_train=False, img_size=img_size)
         
