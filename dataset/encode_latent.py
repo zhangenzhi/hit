@@ -17,6 +17,7 @@ def main():
     parser.add_argument("--batch_size", type=int, default=8, help="Number of *original images* per batch per GPU.")
     parser.add_argument("--num_crops", type=int, default=10, help="Number of RandomResizedCrop augmentations per image")
     parser.add_argument("--num_workers", type=int, default=8, help="Workers per GPU")
+    parser.add_argument("--vae_batch_size", type=int, default=32, help="Mini-batch size for VAE inference to avoid OOM. (Default: 32)")
     args = parser.parse_args()
 
     # --- 1. DDP 初始化 ---
@@ -130,7 +131,7 @@ def main():
 
     # --- 6. 编码循环 ---
     if is_main_process:
-        print("Start encoding with DDP...")
+        print(f"Start encoding with DDP... (VAE mini-batch size: {args.vae_batch_size})")
     
     # 只有 Rank 0 显示进度条，避免刷屏
     iterator = tqdm(loader, desc=f"GPU {rank}", disable=not is_main_process)
@@ -138,42 +139,47 @@ def main():
     with torch.no_grad():
         for batch_imgs, batch_dst_bases in iterator:
             # batch_imgs: (B, num_crops, 3, H, W)
+            # 例如: B=8, num_crops=10 -> 总共 80 张图
             B, N, C, H, W = batch_imgs.shape
             
-            flat_imgs = batch_imgs.view(-1, C, H, W).to(device)
+            # 先 Flatten 到 (B*N, C, H, W)，保持在 CPU 上
+            flat_imgs = batch_imgs.view(-1, C, H, W)
+            total_imgs = flat_imgs.shape[0]
             
-            # 自动混合精度 (H100 强烈推荐)
-            with torch.amp.autocast('cuda', dtype=torch.float16): # 或 bfloat16
-                try:
-                    dist_post = vae.encode(flat_imgs).latent_dist
-                    latents = dist_post.sample()
-                except RuntimeError as e:
-                    if "out of memory" in str(e):
-                        print(f"Rank {rank} OOM, retrying with chunks...")
-                        torch.cuda.empty_cache()
-                        latents_list = []
-                        chunk_size = 4 # 减小 chunk
-                        for i in range(0, flat_imgs.shape[0], chunk_size):
-                            chunk = flat_imgs[i:i+chunk_size]
-                            dist_chunk = vae.encode(chunk).latent_dist
-                            latents_list.append(dist_chunk.sample())
-                        latents = torch.cat(latents_list, dim=0)
-                    else:
-                        raise e
-
-            latents = latents.cpu()
+            latents_list = []
+            
+            # 【核心修改】主动切片处理，避免一次性送入导致 OOM
+            # 每次只处理 vae_batch_size 张图
+            for i in range(0, total_imgs, args.vae_batch_size):
+                # 1. 切片并在此时才移动到 GPU (non_blocking 加速传输)
+                # 这样 GPU 显存中只会有 vae_batch_size 张图，而不是 80 张
+                img_chunk = flat_imgs[i : i + args.vae_batch_size].to(device, non_blocking=True)
+                
+                # 2. 混合精度推理
+                with torch.amp.autocast('cuda', dtype=torch.float16):
+                    dist_post = vae.encode(img_chunk).latent_dist
+                    latents_chunk = dist_post.sample()
+                
+                # 3. 立即移回 CPU，释放 GPU 显存
+                latents_list.append(latents_chunk.cpu())
+            
+            # 拼接回完整 Tensor
+            latents = torch.cat(latents_list, dim=0)
+            
+            # Reshape 回 (B, N, 4, h, w) 方便按文件保存
             latents = latents.view(B, N, *latents.shape[1:])
             
+            # 保存逻辑
             for i, dst_base in enumerate(batch_dst_bases):
                 try:
                     os.makedirs(os.path.dirname(dst_base), exist_ok=True)
                     for j in range(N):
                         save_path = f"{dst_base}_{j}.pt"
-                        # 检查文件是否已存在（可选，防止重复工作，但在 DDP 切片模式下理论上不会冲突）
+                        # 检查文件是否已存在（可选）
                         # if not os.path.exists(save_path):
                         torch.save(latents[i, j].clone(), save_path)
                 except OSError as e:
-                    # 处理多进程创建目录可能的竞争条件 (虽然 makedirs exist_ok=True 通常是安全的)
+                    # 处理多进程创建目录可能的竞争条件
                     pass
 
     if is_main_process:
