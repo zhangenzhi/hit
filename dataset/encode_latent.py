@@ -9,17 +9,47 @@ from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 from diffusers.models import AutoencoderKL
 
+# --- 尝试导入 pynvml 用于监控 GPU 利用率 ---
+try:
+    import pynvml
+    HAS_PYNVML = True
+except ImportError:
+    HAS_PYNVML = False
+
+def get_gpu_stats(local_rank, nvml_handle=None):
+    """
+    获取当前 GPU 的显存和利用率信息
+    """
+    stats = {}
+    
+    # 1. 显存信息 (PyTorch Native, 最准确)
+    # reserved: PyTorch 缓存分配器持有的总显存 (包括未使用的碎片) -> 接近 nvidia-smi 显示的值
+    # allocated: Tensor 实际占用的显存
+    mem_reserved = torch.cuda.memory_reserved() / 1024**3
+    mem_allocated = torch.cuda.memory_allocated() / 1024**3
+    stats['mem'] = f"{mem_allocated:.1f}/{mem_reserved:.1f}GB"
+    
+    # 2. 利用率信息 (Optional, via pynvml)
+    if nvml_handle:
+        try:
+            util = pynvml.nvmlDeviceGetUtilizationRates(nvml_handle)
+            stats['util'] = f"{util.gpu}%"
+        except Exception:
+            stats['util'] = "N/A"
+            
+    return stats
+
 def main():
     parser = argparse.ArgumentParser(description="Encode ImageNet to Latents with Data Augmentation (DDP Support)")
     parser.add_argument("--data_path", type=str, required=True, help="Path to raw ImageNet train directory")
     parser.add_argument("--save_path", type=str, required=True, help="Path to save latents")
     parser.add_argument("--image_size", type=int, default=256)
-    parser.add_argument("--batch_size", type=int, default=32, help="Number of *original images* per batch per GPU.")
-    parser.add_argument("--num_crops", type=int, default=10, help="Number of RandomResizedCrop augmentations per image")
+    parser.add_argument("--batch_size", type=int, default=64, help="Number of *original images* per batch per GPU.")
+    parser.add_argument("--num_crops", type=int, default=32, help="Number of RandomResizedCrop augmentations per image")
     parser.add_argument("--num_workers", type=int, default=8, help="Workers per GPU")
     args = parser.parse_args()
 
-    # --- 1. DDP 初始化 (关键：确保 Rank 和 Device 正确绑定) ---
+    # --- 1. DDP 初始化 ---
     if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
         dist.init_process_group(backend="nccl")
         rank = int(os.environ["RANK"])
@@ -31,7 +61,6 @@ def main():
         device = torch.device(f"cuda:{local_rank}")
         is_main_process = (rank == 0)
         
-        # [Debug] 打印设备绑定信息，确保没有全部挤在 cuda:0
         print(f"[Init] Global Rank {rank} | Local Rank {local_rank} | Device: {torch.cuda.current_device()} | Name: {torch.cuda.get_device_name(device)}")
     else:
         # 单卡模式
@@ -45,11 +74,22 @@ def main():
     if is_main_process:
         print(f"Global Rank 0: Initialized DDP with world_size={world_size}")
 
+    # --- 监控初始化 (仅 Rank 0 需要，因为只有 Rank 0 打印进度条) ---
+    nvml_handle = None
+    if is_main_process and HAS_PYNVML:
+        try:
+            pynvml.nvmlInit()
+            # 注意: 这里假设 local_rank 直接对应 nvml 的设备索引
+            # 在某些复杂的容器配置中可能不一致，但在标准 torchrun 环境下通常是匹配的
+            nvml_handle = pynvml.nvmlDeviceGetHandleByIndex(local_rank)
+        except Exception as e:
+            print(f"Warning: Failed to initialize NVML for monitoring: {e}")
+            nvml_handle = None
+
     # --- 2. 准备 VAE ---
     if is_main_process:
         print(f"Loading VAE to {device}...")
     
-    # 开启 tf32 加速 FP32 计算
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
 
@@ -80,13 +120,11 @@ def main():
                 dst_base = os.path.join(args.save_path, base_name)
                 image_paths.append((src_path, dst_base))
     
-    # 【核心】排序以保证确定性
     image_paths.sort(key=lambda x: x[0])
 
     if is_main_process:
         print(f"Found {len(image_paths)} total images.")
     
-    # 【核心】根据 rank 进行切片分发
     my_paths = image_paths[rank::world_size]
     
     if is_main_process:
@@ -109,7 +147,7 @@ def main():
                 crops = []
                 for _ in range(self.num_crops):
                     crops.append(self.transform(img))
-                img_tensor = torch.stack(crops) # (10, 3, 256, 256)
+                img_tensor = torch.stack(crops)
                 return img_tensor, dst_base
             except Exception as e:
                 print(f"Rank {rank} Error loading {src}: {e}")
@@ -130,37 +168,40 @@ def main():
     if is_main_process:
         print(f"Start encoding with DDP... (Batch Size per GPU: {args.batch_size} imgs * {args.num_crops} crops = {args.batch_size * args.num_crops} inputs)")
     
+    # 只有 Rank 0 显示进度条，并在这里更新 GPU 状态
     iterator = tqdm(loader, desc=f"GPU {rank}", disable=not is_main_process)
     
     with torch.no_grad():
-        for batch_imgs, batch_dst_bases in iterator:
-            # batch_imgs: (B, num_crops, 3, H, W) -> (8, 10, 3, 256, 256)
+        for i, (batch_imgs, batch_dst_bases) in enumerate(iterator):
+            # batch_imgs: (B, num_crops, 3, H, W)
             B, N, C, H, W = batch_imgs.shape
             
-            # 直接 Flatten 并移入 GPU。对于 H100 来说，80 张 256x256 的图是小菜一碟。
             flat_imgs = batch_imgs.view(-1, C, H, W).to(device, non_blocking=True)
             
-            # 混合精度推理
             with torch.amp.autocast('cuda', dtype=torch.float16):
                 dist_post = vae.encode(flat_imgs).latent_dist
-                latents = dist_post.sample() # (80, 4, 32, 32)
+                latents = dist_post.sample()
             
-            # 移回 CPU
             latents = latents.cpu()
-            
-            # Reshape 回 (B, N, 4, h, w)
             latents = latents.view(B, N, *latents.shape[1:])
             
-            # 保存逻辑
-            for i, dst_base in enumerate(batch_dst_bases):
+            for k, dst_base in enumerate(batch_dst_bases):
                 try:
                     os.makedirs(os.path.dirname(dst_base), exist_ok=True)
                     for j in range(N):
                         save_path = f"{dst_base}_{j}.pt"
-                        # 保存 Unscaled Latent
-                        torch.save(latents[i, j].clone(), save_path)
+                        torch.save(latents[k, j].clone(), save_path)
                 except OSError:
                     pass
+            
+            # --- 更新监控信息 (每5个batch更新一次以减少开销) ---
+            if is_main_process and i % 5 == 0:
+                stats = get_gpu_stats(local_rank, nvml_handle)
+                # Mem: Allocated / Reserved
+                postfix_str = f"Mem:{stats.get('mem')} "
+                if 'util' in stats:
+                    postfix_str += f"Util:{stats.get('util')}"
+                iterator.set_postfix_str(postfix_str)
 
     if is_main_process:
         print(f"Done! Latents saved to {args.save_path}")
