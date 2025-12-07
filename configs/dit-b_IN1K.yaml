@@ -5,7 +5,7 @@ data:
   # 之前是: /work/c30778/dataset/imagenet/
   data_path: "/work/c30778/imagenet_latent/"
   image_size: 256
-  num_workers: 16  # Latent 读取很快，可以适当增加 worker
+  num_workers: 32  # Latent 读取很快，可以适当增加 worker
 
 model:
   # DiT-B Config

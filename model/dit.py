@@ -244,11 +244,14 @@ class DiT(nn.Module):
         half = x[: len(x) // 2]
         combined = torch.cat([half, half], dim=0)
         model_out = self.forward(combined, t, y)
-        # For exact reproducibility reasons, we apply classifier-free guidance on only
-        # three channels by default. The standard approach to cfg applies it to all channels.
-        # This can be done by uncommenting the following line and commenting-out the line following that.
-        # eps, rest = model_out[:, :self.in_channels], model_out[:, self.in_channels:]
-        eps, rest = model_out[:, :3], model_out[:, 3:]
+        
+        # 【关键修复】：原来的 model_out[:, :3] 是错误的！
+        # 对于 Latent Diffusion，in_channels 是 4，不是 3。
+        # 如果模型学习了 sigma，out_channels 是 8。
+        # 我们应该根据 input_channels 来切分 epsilon。
+        
+        eps, rest = model_out[:, :self.in_channels], model_out[:, self.in_channels:]
+        
         cond_eps, uncond_eps = torch.split(eps, len(eps) // 2, dim=0)
         half_eps = uncond_eps + cfg_scale * (cond_eps - uncond_eps)
         eps = torch.cat([half_eps, half_eps], dim=0)
