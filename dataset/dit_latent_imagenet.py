@@ -1,116 +1,129 @@
 import os
 import torch
-from torchvision import datasets, transforms
-from torch.utils.data import DataLoader, DistributedSampler
+import logging
+from torchvision import datasets
+from torch.utils.data import DataLoader, DistributedSampler, Dataset
+
+# 安全加载函数，防止损坏的文件中断训练
+def robust_loader(path):
+    try:
+        # map_location='cpu' 避免多线程加载时占用过多 GPU 显存
+        return torch.load(path, map_location='cpu')
+    except Exception as e:
+        print(f"Error loading {path}: {e}")
+        # 返回一个全 0 的 Latent 作为 Fallback (4, 32, 32) 是 DiT-B/2/4 在 256px 下的 Latent 尺寸
+        return torch.zeros(4, 32, 32)
 
 class LatentFolder(datasets.DatasetFolder):
+    """
+    专门用于读取预编码 Latent 的 Dataset。
+    由于数据增强已经在 Encode 阶段完成（保存了 img_0.pt, img_1.pt 等），
+    这里不需要再做 RandomResizedCrop。
+    """
     def __init__(self, root):
         super().__init__(
             root,
-            loader=torch.load, 
+            loader=robust_loader, 
             extensions=('.pt',), 
-            transform=None      
+            transform=None # Latent 模式下不进行 Transform
         )
-
-def build_dit_transform(is_train, img_size):
-    """
-    构建适合 DiT (Diffusion Transformer) 训练的数据增强 (仅针对 Pixel 数据)。
-    """
-    # DiT/Diffusion Model 标准归一化: map [0, 1] to [-1, 1]
-    mean = [0.5, 0.5, 0.5]
-    std = [0.5, 0.5, 0.5]
-
-    if is_train:
-        transform = transforms.Compose([
-            # 【关键修复】使用标准的 ImageNet RandomResizedCrop (scale=0.08-1.0)
-            # 之前的 scale=(0.8, 1.0) 过于保守，接近 CenterCrop，限制了模型学习尺度不变性，
-            # 导致 FID 在验证集（通常包含不同尺度的物体）上表现不佳。
-            transforms.RandomResizedCrop(img_size, scale=(0.08, 1.0), interpolation=transforms.InterpolationMode.BICUBIC),
-            transforms.RandomHorizontalFlip(),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=mean, std=std)
-        ])
-    else:
-        # 验证集保持标准的 Resize + CenterCrop，这是计算 FID 的对齐标准
-        transform = transforms.Compose([
-            transforms.Resize(img_size, interpolation=transforms.InterpolationMode.BICUBIC),
-            transforms.CenterCrop(img_size),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=mean, std=std)
-        ])
-    
-    return transform
 
 def build_dit_dataloaders(args):
     """
     DiT 专用 DataLoader 构建函数。
+    支持：
+    1. Pixel Mode (原始图片): 在线 RandomResizedCrop + VAE Encode (慢，但在显存充足时更灵活)
+    2. Latent Mode (预处理特征): 离线增强并保存 (极快，IO 密集型)
     """
-    # 获取参数
     data_dir = getattr(args, 'data_path', getattr(args, 'data_dir', None))
     if data_dir is None:
         raise ValueError("args must contain 'data_path' or 'data_dir'")
 
-    # --- 兼容性处理逻辑 ---
+    # 获取参数
     model_conf = getattr(args, 'model', {})
     training_conf = getattr(args, 'training', {})
     
-    if isinstance(model_conf, dict) and 'image_size' in model_conf:
-        img_size = model_conf['image_size']
-    elif isinstance(model_conf, dict) and 'img_size' in model_conf:
-        img_size = model_conf['img_size']
-    else:
-        img_size = getattr(args, 'image_size', getattr(args, 'img_size', 256))
-
+    # Batch Size
     if isinstance(training_conf, dict) and 'batch_size' in training_conf:
         batch_size = training_conf['batch_size']
     else:
         batch_size = getattr(args, 'batch_size', 32)
 
-    num_workers = getattr(args, 'num_workers', 4)
-
+    num_workers = getattr(args, 'num_workers', 16)
     rank = int(os.environ.get('RANK', 0))
     
-    # 1. 路径检查
     train_root = os.path.join(data_dir, 'train')
     val_root = os.path.join(data_dir, 'val')
     
+    # 容错：如果 data_dir 直接就是 train 目录
     if not os.path.exists(train_root):
         train_root = data_dir
         val_root = None 
 
-    # 2. 自动检测数据类型 (Pixel vs Latent)
+    # --- 自动检测模式 ---
     is_latent = False
     try:
+        # 简单探测：检查第一个文件夹里是否有 .pt 文件
         with os.scandir(train_root) as it:
             first_entry = next(it)
             if first_entry.is_dir():
                 with os.scandir(first_entry.path) as it_files:
-                    first_file = next(it_files)
-                    if first_file.name.endswith('.pt'):
-                        is_latent = True
-    except (StopIteration, FileNotFoundError):
+                    # 尝试找几个文件
+                    for _ in range(5):
+                        f = next(it_files, None)
+                        if f and f.name.endswith('.pt'):
+                            is_latent = True
+                            break
+    except (StopIteration, FileNotFoundError, PermissionError):
         pass 
 
     if rank == 0:
-        mode_str = "Latent (.pt) [Fast Mode]" if is_latent else "Pixel (Image) [Standard Mode]"
-        print(f"构建 DiT Dataloaders | Mode: {mode_str} | Size: {img_size} | Batch: {batch_size}")
+        mode_str = "Latent (.pt) [High Throughput]" if is_latent else "Pixel (Image) [Online Encoding]"
+        print(f"Build DiT Dataloaders | Mode: {mode_str} | Batch: {batch_size} | Workers: {num_workers}")
+        if is_latent:
+            print(f"NOTE: Ensure latents were generated with Data Augmentation (RandomResizedCrop) for best results.")
 
-    # 3. 构建 Dataset
+    # --- 构建 Dataset ---
     if is_latent:
-        # Latent 模式: 使用 LatentFolder，无 Transform
-        # 注意: 如果需要刷 SOTA FID，离线 Latent 必须在生成时就应用 RandomResizedCrop
-        # 否则建议使用 Pixel 模式进行训练
+        # Latent 模式：直接读取
+        # 由于我们生成了 img_0.pt, img_1.pt，DatasetFolder 会自动将它们视为同一类别的不同样本
+        # 从而自然地实现了数据集扩充 (10x)。
         train_dataset = LatentFolder(train_root)
+        
+        # 验证集通常不需要 Augmentation，如果是 Latent 格式，直接读取即可
+        # (通常 FID 评估我们还是建议用 Pixel 模式的 DataLoader 读取真实图片，
+        # 但如果是单纯算 Validation Loss，用 Latent 没问题)
         val_dataset = LatentFolder(val_root) if (val_root and os.path.exists(val_root)) else None
+        
     else:
-        # Pixel 模式: 使用 ImageFolder，带 RandomResizedCrop
-        train_transform = build_dit_transform(is_train=True, img_size=img_size)
-        val_transform = build_dit_transform(is_train=False, img_size=img_size)
+        # Pixel 模式：需要在线 Transform
+        from torchvision import transforms
+        
+        # 从 args 获取 image_size
+        if isinstance(model_conf, dict) and 'image_size' in model_conf:
+            img_size = model_conf['image_size']
+        else:
+            img_size = getattr(args, 'image_size', 256)
+
+        # DiT Training Transform (Online)
+        train_transform = transforms.Compose([
+            transforms.RandomResizedCrop(img_size, scale=(0.08, 1.0), interpolation=transforms.InterpolationMode.BICUBIC),
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
+        ])
+        
+        val_transform = transforms.Compose([
+            transforms.Resize(img_size, interpolation=transforms.InterpolationMode.BICUBIC),
+            transforms.CenterCrop(img_size),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
+        ])
         
         train_dataset = datasets.ImageFolder(train_root, transform=train_transform)
         val_dataset = datasets.ImageFolder(val_root, transform=val_transform) if (val_root and os.path.exists(val_root)) else None
 
-    # 4. 分布式采样器
+    # --- 构建 Loader ---
     use_ddp = torch.distributed.is_initialized()
     
     if use_ddp:
@@ -120,7 +133,6 @@ def build_dit_dataloaders(args):
         train_sampler = None
         val_sampler = None
 
-    # 5. 构建 DataLoaders
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
