@@ -340,7 +340,7 @@ class DiTImangenetTrainer:
             if epoch % viz_interval == 0:
                 self.visualize(epoch)
             
-        if epoch > 0 and epoch % 5 == 0:
+        if epoch > 0 and epoch % 1 == 0:
              self.evaluate_fid(epoch, num_gen_batches=50) 
 
     def save_checkpoint(self, epoch):

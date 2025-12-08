@@ -3,7 +3,7 @@
 data:
   # 【关键修改 1】指向预处理好的 Latent 目录
   # 之前是: /work/c30778/dataset/imagenet/
-  data_path: "/work/c30778/imagenet_latent/"
+  data_path: "/work/c30778/imagenet_rc10_latent/"
   image_size: 256
   num_workers: 32  # Latent 读取很快，可以适当增加 worker
 
@@ -25,7 +25,7 @@ diffusion:
   schedule: "cosine"  # 强烈建议使用我们添加的 Cosine Schedule
 
 training:
-  epochs: 400
+  epochs: 40
   
   # 以前跑 Pixel 时可能只能开 32-64，现在 Latent 模式下 H100 可以轻松跑 128-256
   batch_size: 256     
@@ -34,7 +34,7 @@ training:
   results_dir: "./results/dit_b_2_latent-v4"
   use_amp: True       # 混合精度
   seed: 42
-  log_interval: 50
+  log_interval: 5
   save_interval: 1
   
   # 调试参数 (正式训练请注释掉或设为 null)
