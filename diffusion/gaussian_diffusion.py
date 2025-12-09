@@ -36,10 +36,9 @@ class GaussianDiffusion:
         self.num_timesteps = num_timesteps
         self.device = device
         
-        # 默认配置适配 DiT
         self.model_mean_type = ModelMeanType.EPSILON
-        self.model_var_type = ModelVarType.LEARNED_RANGE # DiT 使用 learned_range
-        self.loss_type = LossType.MSE # 实际上是 MSE + VLB (Hybrid)
+        self.model_var_type = ModelVarType.LEARNED_RANGE
+        self.loss_type = LossType.MSE
 
         if schedule == "linear":
             betas = np.linspace(beta_start, beta_end, num_timesteps, dtype=np.float64)
@@ -84,7 +83,6 @@ class GaussianDiffusion:
             (1.0 - self.alphas_cumprod_prev) * np.sqrt(alphas) / (1.0 - self.alphas_cumprod)
         )
         
-        # 转换所有 numpy 数组为 torch tensor
         for k, v in self.__dict__.items():
             if isinstance(v, np.ndarray):
                 setattr(self, k, th.from_numpy(v).to(device=device, dtype=th.float32))
@@ -114,25 +112,22 @@ class GaussianDiffusion:
         )
         return posterior_mean, posterior_variance, posterior_log_variance_clipped
 
-    def p_mean_variance(self, model, x, t, clip_denoised=True, model_kwargs=None):
+    # [FIX] Default clip_denoised set to False for Latent Diffusion
+    def p_mean_variance(self, model, x, t, clip_denoised=False, model_kwargs=None):
         if model_kwargs is None:
             model_kwargs = {}
 
         B, C = x.shape[:2]
         model_output = model(x, t, **model_kwargs)
 
-        # DiT output format: [epsilon, variance_factor]
-        # split output
         if model_output.shape[1] == 2 * C:
             model_output, model_var_values = th.split(model_output, C, dim=1)
             min_log = _extract_into_tensor(self.posterior_log_variance_clipped, t, x.shape)
             max_log = _extract_into_tensor(th.log(self.betas), t, x.shape)
-            # The model_var_values is [-1, 1] for [min_var, max_var].
             frac = (model_var_values + 1) / 2
             model_log_variance = frac * max_log + (1 - frac) * min_log
             model_variance = th.exp(model_log_variance)
         else:
-            # Fixed variance case
             model_variance, model_log_variance = (
                 self.posterior_variance,
                 self.posterior_log_variance_clipped,
@@ -142,6 +137,7 @@ class GaussianDiffusion:
 
         def process_xstart(x):
             if clip_denoised:
+                # [Note] Only safe for pixel space, dangerous for latent space
                 return x.clamp(-1, 1)
             return x
 
@@ -158,7 +154,8 @@ class GaussianDiffusion:
             "pred_xstart": pred_xstart,
         }
 
-    def _vb_terms_bpd(self, model, x_start, x_t, t, clip_denoised=True, model_kwargs=None):
+    # [FIX] Default clip_denoised set to False
+    def _vb_terms_bpd(self, model, x_start, x_t, t, clip_denoised=False, model_kwargs=None):
         true_mean, _, true_log_variance_clipped = self.q_posterior_mean_variance(
             x_start=x_start, x_t=x_t, t=t
         )
@@ -187,24 +184,20 @@ class GaussianDiffusion:
         terms = {}
         model_output = model(x_t, t, **model_kwargs)
 
-        # DiT Learned Variance Logic
         B, C = x_t.shape[:2]
         if model_output.shape[1] == 2 * C:
             model_output, model_var_values = th.split(model_output, C, dim=1)
-            # Learn the variance using the variational bound, but don't let
-            # it affect our mean prediction.
             frozen_out = th.cat([model_output.detach(), model_var_values], dim=1)
             
-            # 计算 VLB (Variational Lower Bound) loss 用于优化方差
+            # [FIX] Ensure clip_denoised=False for VLB calculation on latents
             terms["vb"] = self._vb_terms_bpd(
                 model=lambda *args, r=frozen_out: r,
                 x_start=x_start,
                 x_t=x_t,
                 t=t,
-                clip_denoised=False,
+                clip_denoised=False, 
             )["output"]
             
-            # OpenAI IDDPM 建议: VLB loss 权重设为 1/1000 以避免覆盖 MSE
             terms["vb"] *= self.num_timesteps / 1000.0
 
         target = noise
@@ -229,12 +222,11 @@ def normal_kl(mean1, logvar1, mean2, logvar2):
     )
 
 def discretized_gaussian_log_likelihood(x, *, means, log_scales):
-    # Assumes data is integers [0, 255] rescaled to [-1, 1]
     assert x.shape == means.shape == log_scales.shape
     centered_x = x - means
     inv_stdv = th.exp(-log_scales)
     plus_in = inv_stdv * (centered_x + 1.0 / 255.0)
-    cdf_plus = th.sigmoid(plus_in) # approx normal cdf using sigmoid
+    cdf_plus = th.sigmoid(plus_in)
     min_in = inv_stdv * (centered_x - 1.0 / 255.0)
     cdf_min = th.sigmoid(min_in)
     log_cdf_plus = th.log(cdf_plus.clamp(min=1e-12))
