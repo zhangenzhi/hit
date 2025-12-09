@@ -198,7 +198,9 @@ class GaussianDiffusion:
                 clip_denoised=False, 
             )["output"]
             
-            terms["vb"] *= self.num_timesteps / 1000.0
+            # [CRITICAL FIX] Use 1e-3 weight for VLB loss.
+            # Previously it was (num_timesteps/1000.0) which is ~1.0, overwhelming the MSE loss.
+            terms["vb"] *= 1e-3
 
         target = noise
         terms["mse"] = mean_flat((target - model_output) ** 2)
