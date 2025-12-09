@@ -77,12 +77,12 @@ class DiTImangenetTrainer:
             print(f"EMA initialized with decay: {self.ema.decay}")
         
         # 编译优化 (可根据需要开启)
-        try:
-            self.model = torch.compile(self.model, mode="default")
-            if config.local_rank == 0:
-                print("Model compiled with torch.compile")
-        except Exception as e:
-            print(f"Warning: torch.compile failed: {e}")
+        # try:
+        #     self.model = torch.compile(self.model, mode="default")
+        #     if config.local_rank == 0:
+        #         print("Model compiled with torch.compile")
+        # except Exception as e:
+        #     print(f"Warning: torch.compile failed: {e}")
 
         self.fid_metric = None
         try:
@@ -145,7 +145,15 @@ class DiTImangenetTrainer:
                 alpha_bar_t_prev = self.diffusion.alphas_cumprod[prev_t].to(self.device).float()
             
             sigma_t = eta * torch.sqrt((1 - alpha_bar_t_prev) / (1 - alpha_bar_t) * (1 - alpha_bar_t / alpha_bar_t_prev))
+            
+            # Predict x0 (in SCALED space)
+            # [WARNING] 当 t 很大(alpha_bar_t很小)时，此处除法会导致数值爆炸，尤其是在模型未训练好时
             pred_x0 = (x - torch.sqrt(1 - alpha_bar_t) * eps) / torch.sqrt(alpha_bar_t)
+            
+            # [FIX] 对 pred_x0 进行截断。Latent (std=1) 的正常范围在 [-3, 3] 左右。
+            # 这能有效防止 Epoch 0 时的数值爆炸 (你的 Std: 19708 就是这里导致的)。
+            pred_x0 = pred_x0.clamp(-3.0, 3.0)
+            
             dir_xt = torch.sqrt(1 - alpha_bar_t_prev - sigma_t**2) * eps
             noise = sigma_t * torch.randn_like(x)
             x = torch.sqrt(alpha_bar_t_prev) * pred_x0 + dir_xt + noise
