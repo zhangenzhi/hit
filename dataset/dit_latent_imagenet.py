@@ -1,39 +1,63 @@
 import os
 import torch
 import logging
+import random
 from torchvision import datasets
 from torch.utils.data import DataLoader, DistributedSampler, Dataset
 
-# 安全加载函数，防止损坏的文件中断训练
+# [Fix 2] Fallback 形状修正
+# 假设预处理时 num_crops=10。如果不确定，这里返回 None，在 getitem 里处理会更稳健
 def robust_loader(path):
     try:
         # map_location='cpu' 避免多线程加载时占用过多 GPU 显存
         return torch.load(path, map_location='cpu')
     except Exception as e:
         print(f"Error loading {path}: {e}")
-        # 返回一个全 0 的 Latent 作为 Fallback (4, 32, 32) 是 DiT-B/2/4 在 256px 下的 Latent 尺寸
-        return torch.zeros(4, 32, 32)
+        return None  # 返回 None，让 Dataset 处理
 
 class LatentFolder(datasets.DatasetFolder):
     """
     专门用于读取预编码 Latent 的 Dataset。
-    由于数据增强已经在 Encode 阶段完成（保存了 img_0.pt, img_1.pt 等），
-    这里不需要再做 RandomResizedCrop。
+    支持从包含多个 crops 的 .pt 文件中进行采样。
     """
-    def __init__(self, root):
+    def __init__(self, root, is_train=True):
         super().__init__(
             root,
             loader=robust_loader, 
             extensions=('.pt',), 
-            transform=None # Latent 模式下不进行 Transform
+            transform=None 
         )
+        self.is_train = is_train
+
+    def __getitem__(self, index):
+        path, target = self.samples[index]
+        sample = self.loader(path)
+        
+        # [Fix 2] 处理加载失败的情况 (Fallback)
+        if sample is None:
+            # 假设标准尺寸，这里需要根据你的实际 Latent 尺寸硬编码或者动态获取
+            # 如果 sample 为 None，我们生成一个全0的 latent 避免崩溃
+            # 注意：这里的形状是最终喂给模型的形状 [4, 32, 32]
+            return torch.zeros(4, 32, 32), target
+
+        # [Fix 1] 处理多 Crop 维度 [Num_Crops, C, H, W] -> [C, H, W]
+        if sample.dim() == 4: 
+            num_crops = sample.shape[0]
+            if self.is_train:
+                # 训练时：随机选一个 crop，实现数据增强效果
+                idx = random.randint(0, num_crops - 1)
+                sample = sample[idx]
+            else:
+                # 验证时：固定选第一个，保证验证指标稳定
+                # (前提是所有样本也是这样处理的)
+                sample = sample[0]
+        
+        # 此时 sample 形状应为 [4, 32, 32]
+        return sample, target
 
 def build_dit_dataloaders(args):
     """
     DiT 专用 DataLoader 构建函数。
-    支持：
-    1. Pixel Mode (原始图片): 在线 RandomResizedCrop + VAE Encode (慢，但在显存充足时更灵活)
-    2. Latent Mode (预处理特征): 离线增强并保存 (极快，IO 密集型)
     """
     data_dir = getattr(args, 'data_path', getattr(args, 'data_dir', None))
     if data_dir is None:
@@ -43,7 +67,6 @@ def build_dit_dataloaders(args):
     model_conf = getattr(args, 'model', {})
     training_conf = getattr(args, 'training', {})
     
-    # Batch Size
     if isinstance(training_conf, dict) and 'batch_size' in training_conf:
         batch_size = training_conf['batch_size']
     else:
@@ -55,7 +78,6 @@ def build_dit_dataloaders(args):
     train_root = os.path.join(data_dir, 'train')
     val_root = os.path.join(data_dir, 'val')
     
-    # 容错：如果 data_dir 直接就是 train 目录
     if not os.path.exists(train_root):
         train_root = data_dir
         val_root = None 
@@ -63,12 +85,10 @@ def build_dit_dataloaders(args):
     # --- 自动检测模式 ---
     is_latent = False
     try:
-        # 简单探测：检查第一个文件夹里是否有 .pt 文件
         with os.scandir(train_root) as it:
             first_entry = next(it)
             if first_entry.is_dir():
                 with os.scandir(first_entry.path) as it_files:
-                    # 尝试找几个文件
                     for _ in range(5):
                         f = next(it_files, None)
                         if f and f.name.endswith('.pt'):
@@ -80,32 +100,22 @@ def build_dit_dataloaders(args):
     if rank == 0:
         mode_str = "Latent (.pt) [High Throughput]" if is_latent else "Pixel (Image) [Online Encoding]"
         print(f"Build DiT Dataloaders | Mode: {mode_str} | Batch: {batch_size} | Workers: {num_workers}")
-        if is_latent:
-            print(f"NOTE: Ensure latents were generated with Data Augmentation (RandomResizedCrop) for best results.")
 
     # --- 构建 Dataset ---
     if is_latent:
-        # Latent 模式：直接读取
-        # 由于我们生成了 img_0.pt, img_1.pt，DatasetFolder 会自动将它们视为同一类别的不同样本
-        # 从而自然地实现了数据集扩充 (10x)。
-        train_dataset = LatentFolder(train_root)
-        
-        # 验证集通常不需要 Augmentation，如果是 Latent 格式，直接读取即可
-        # (通常 FID 评估我们还是建议用 Pixel 模式的 DataLoader 读取真实图片，
-        # 但如果是单纯算 Validation Loss，用 Latent 没问题)
-        val_dataset = LatentFolder(val_root) if (val_root and os.path.exists(val_root)) else None
+        # [Modify] 传入 is_train 标志
+        train_dataset = LatentFolder(train_root, is_train=True)
+        val_dataset = LatentFolder(val_root, is_train=False) if (val_root and os.path.exists(val_root)) else None
         
     else:
-        # Pixel 模式：需要在线 Transform
+        # Pixel 模式：保持原样
         from torchvision import transforms
         
-        # 从 args 获取 image_size
         if isinstance(model_conf, dict) and 'image_size' in model_conf:
             img_size = model_conf['image_size']
         else:
             img_size = getattr(args, 'image_size', 256)
 
-        # DiT Training Transform (Online)
         train_transform = transforms.Compose([
             transforms.RandomResizedCrop(img_size, scale=(0.08, 1.0), interpolation=transforms.InterpolationMode.BICUBIC),
             transforms.RandomHorizontalFlip(),
