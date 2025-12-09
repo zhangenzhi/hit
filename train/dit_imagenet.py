@@ -208,7 +208,7 @@ class DiTImangenetTrainer:
             self.model.train()
 
     @torch.no_grad()
-    def evaluate_fid(self, epoch, num_gen_batches=50):
+    def evaluate_fid(self, epoch, num_gen_batches=10):
         if self.fid_metric is None:
             return
 
@@ -340,7 +340,7 @@ class DiTImangenetTrainer:
             if epoch % viz_interval == 0:
                 self.visualize(epoch)
             
-        if epoch > 0 and epoch % 1 == 0:
+        if epoch > 0 and epoch % 10 == 0:
              self.evaluate_fid(epoch, num_gen_batches=50) 
 
     def save_checkpoint(self, epoch):
