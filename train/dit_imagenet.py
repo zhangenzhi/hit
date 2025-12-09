@@ -77,12 +77,12 @@ class DiTImangenetTrainer:
             print(f"EMA initialized with decay: {self.ema.decay}")
         
         # 编译优化 (可根据需要开启)
-        # try:
-        #     self.model = torch.compile(self.model, mode="default")
-        #     if config.local_rank == 0:
-        #         print("Model compiled with torch.compile")
-        # except Exception as e:
-        #     print(f"Warning: torch.compile failed: {e}")
+        try:
+            self.model = torch.compile(self.model, mode="default")
+            if config.local_rank == 0:
+                print("Model compiled with torch.compile")
+        except Exception as e:
+            print(f"Warning: torch.compile failed: {e}")
 
         self.fid_metric = None
         try:

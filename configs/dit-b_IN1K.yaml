@@ -34,7 +34,7 @@ training:
   results_dir: "./results/dit_b_2_latent-v4"
   use_amp: True       # 混合精度
   seed: 42
-  log_interval: 50
+  log_interval: 1
   save_interval: 1
   
   # 调试参数 (正式训练请注释掉或设为 null)
