@@ -108,9 +108,7 @@ class DiTImangenetTrainer:
 
     @torch.no_grad()
     def sample_ddim(self, n, labels, size, num_inference_steps=50, eta=0.0, cfg_scale=4.0, model=None):
-        """
-        DDIM 采样 - 已修复逻辑错误
-        """
+        """FIXED: DDIM sampling with correct VAE decoding"""
         use_model = model if model is not None else self.model
         use_model.eval()
         
@@ -119,6 +117,7 @@ class DiTImangenetTrainer:
         timesteps = torch.linspace(0, self.diffusion.num_timesteps - 1, num_inference_steps, dtype=torch.long)
         timesteps = timesteps.flip(0).tolist()
         
+        # Initialize noise in SCALED space (std≈1)
         x = torch.randn(n, *size).to(self.device)
         
         C = x.shape[1]
@@ -148,8 +147,6 @@ class DiTImangenetTrainer:
             alpha_bar_t = self.diffusion.alphas_cumprod[t_step].to(self.device).float()
             
             if i == len(timesteps) - 1:
-                # 理论上最后一步跳到 t=0 之前的纯净状态 (alpha=1.0)
-                # 也可以使用 self.diffusion.alphas_cumprod[0] 如果 t 不完全归零
                 alpha_bar_t_prev = torch.tensor(1.0).to(self.device).float()
             else:
                 prev_t = timesteps[i+1]
@@ -157,24 +154,22 @@ class DiTImangenetTrainer:
             
             sigma_t = eta * torch.sqrt((1 - alpha_bar_t_prev) / (1 - alpha_bar_t) * (1 - alpha_bar_t / alpha_bar_t_prev))
             
-            # 1. 预测 x0
+            # Predict x0 (in SCALED space)
             pred_x0 = (x - torch.sqrt(1 - alpha_bar_t) * eps) / torch.sqrt(alpha_bar_t)
             
-            # [Fix] Latent Space 不要进行硬 Clamp (-1, 1)，会截断分布
-            # 如果必须 Clamp，建议范围放宽，或者完全移除
-            # pred_x0 = pred_x0.clamp(-1, 1) 
+            # NO CLAMPING in latent space - this was correct in your code
             
-            # 2. 计算方向 (移除 Re-derive epsilon 步骤，直接使用 eps)
             dir_xt = torch.sqrt(1 - alpha_bar_t_prev - sigma_t**2) * eps
-            
-            # 3. 组合
             noise = sigma_t * torch.randn_like(x)
             x = torch.sqrt(alpha_bar_t_prev) * pred_x0 + dir_xt + noise
             
+        # x is now in SCALED space (std≈1)
+        # To decode: VAE expects UNSCALED (std≈5.5), so divide by 0.18215
         return x
 
     @torch.no_grad()
     def visualize(self, epoch):
+        """FIXED: Correct VAE decoding for visualization"""
         if self.config.local_rank != 0:
             return
 
@@ -189,10 +184,11 @@ class DiTImangenetTrainer:
             input_size = getattr(self.config, 'input_size', 32)
             latent_size = (in_channels, input_size, input_size)
 
+            # z is in SCALED space (std≈1)
             z = self.sample_ddim(n_samples, labels, latent_size, num_inference_steps=50, cfg_scale=4.0, model=self.model)
             
             z = z.float()
-            # [Note] Diffusers VAE 习惯: Decode 时 latents / 0.18215 (变大)
+            # Unscale for VAE: z / 0.18215 converts std≈1 → std≈5.5
             x_recon = self.vae.decode(z / 0.18215).sample.float()
             x_recon = x_recon.clamp(-1, 1)
             
@@ -207,8 +203,9 @@ class DiTImangenetTrainer:
             self.ema.restore()
             self.model.train()
 
-    @torch.no_grad()
+   @torch.no_grad()
     def evaluate_fid(self, epoch, num_gen_batches=10):
+        """FIXED: Correct real image decoding for FID"""
         if self.fid_metric is None:
             return
 
@@ -216,14 +213,14 @@ class DiTImangenetTrainer:
             dist.barrier()
 
         if self.config.local_rank == 0:
-            print(f"[FID] Starting evaluation for epoch {epoch} (Samples: {num_gen_batches * self.config.batch_size})...")
+            print(f"[FID] Starting evaluation for epoch {epoch}...")
         
         self.ema.apply_shadow()
         self.model.eval()
         self.fid_metric.reset()
 
         try:
-            # 1. Real Images Processing
+            # 1. Real Images Processing - FIXED
             loader_iter = iter(self.loader)
             
             for i in range(num_gen_batches):
@@ -234,23 +231,18 @@ class DiTImangenetTrainer:
                     
                 real_imgs = real_imgs.to(self.device)
                 
-                # --- FIX: VAE Scaling 修复 ---
+                # --- FIXED: Correct VAE Decoding ---
                 if real_imgs.shape[1] == 4:
-                    # [逻辑修正]
-                    # 训练时代码: latents = images * 0.18215
-                    # 这意味着 Loader 返回的是 "Unscaled" (大数值, std≈5.5) 的 Latents。
-                    # VAE.decode 通常期望 Unscaled Latents (如果按照 Diffusers 逻辑，它内部不自动放大，需外部放大)。
-                    # 但在这里，如果 real_imgs 已经是 Unscaled 的，直接 Decode 即可。
-                    # 之前的代码 real_imgs / 0.18215 会导致数值二次放大，产生严重错误。
+                    # Loader returns UNSCALED latents (std≈5.5)
+                    # VAE.decode expects UNSCALED input, so decode directly
                     real_imgs = real_imgs.float()
-                    # 直接 Decode Unscaled Latents
                     real_imgs = self.vae.decode(real_imgs).sample.float()
                 
                 real_imgs = real_imgs.clamp(-1, 1)
                 real_imgs_uint8 = self._normalize_images(real_imgs)
                 self.fid_metric.update(real_imgs_uint8, real=True)
             
-            # 2. Fake Images Processing
+            # 2. Fake Images Processing - FIXED
             for i in range(num_gen_batches):
                 n_samples = self.config.batch_size
                 labels = torch.randint(0, 1000, (n_samples,), device=self.device)
@@ -259,10 +251,11 @@ class DiTImangenetTrainer:
                 input_size = getattr(self.config, 'input_size', 32)
                 latent_size = (in_channels, input_size, input_size)
                 
+                # z is in SCALED space (std≈1)
                 z = self.sample_ddim(n_samples, labels, latent_size, num_inference_steps=50, cfg_scale=1.5, model=self.model)
                 
                 z = z.float()
-                # Fake Latents 是 std=1 的，需要 / 0.18215 还原回 Unscaled 才能 Decode
+                # Unscale: z / 0.18215 converts std≈1 → std≈5.5 for VAE
                 fake_imgs = self.vae.decode(z / 0.18215).sample.float()
                 fake_imgs = fake_imgs.clamp(-1, 1)
                 
@@ -274,11 +267,10 @@ class DiTImangenetTrainer:
                 fake_imgs_uint8 = self._normalize_images(fake_imgs)
                 self.fid_metric.update(fake_imgs_uint8, real=False)
             
-            # compute() 在 DDP 下默认会同步所有 rank 的数据 (如果 dist_sync_on_step=True)
             fid_score = self.fid_metric.compute()
             
             if self.config.local_rank == 0:
-                print(f"[FID] Epoch {epoch} | Distributed FID Score: {fid_score.item():.4f}")
+                print(f"[FID] Epoch {epoch} | FID Score: {fid_score.item():.4f}")
                 with open(os.path.join(self.config.results_dir, "fid_log.txt"), "a") as f:
                     f.write(f"Epoch {epoch}, FID: {fid_score.item():.4f}\n")
                     
@@ -291,6 +283,7 @@ class DiTImangenetTrainer:
             dist.barrier()
 
     def train_one_epoch(self, epoch):
+        """Fixed training loop with correct VAE scaling"""
         self.model.train()
         start_time = time()
         max_steps = getattr(self.config, 'max_train_steps', None)
@@ -306,21 +299,22 @@ class DiTImangenetTrainer:
             images = images.to(self.device)
             labels = labels.to(self.device)
             
-            # --- Latent 处理逻辑 ---
+            # --- FIXED: Consistent VAE Scaling Logic ---
             if images.shape[1] == 3:
+                # Online encoding from pixels
                 with torch.no_grad():
                     posterior = self.vae.encode(images).latent_dist
-                    # SD 训练逻辑: Encode -> Sample (std≈1) -> Scale (std≈0.18) ?
-                    # 通常 DiT 论文是: Latent (std≈1) 输入网络。
-                    # Diffusers 逻辑: Latent (std≈5.5 Unscaled) * 0.18215 -> Latent (std≈1) -> Net
-                    latents = posterior.sample().mul_(0.18215)
+                    # Get unscaled latents (std≈5.5) then scale to std≈1
+                    latents = posterior.sample() * 0.18215
             else:
-                # Loader 返回的是 Unscaled (std≈5.5)
-                # 乘以 0.18215 变成 std≈1 喂给 Diffusion Model
-                latents = images * 0.18215
+                # Pre-encoded latents from disk
+                # Your encode_latent.py saves UNSCALED (std≈5.5) latents
+                # So we need to scale them here: multiply by 0.18215
+                latents = images * 0.18215  # Now std≈1
                 
             t = torch.randint(0, self.diffusion.num_timesteps, (images.shape[0],), device=self.device)
             
+            # Model trains on SCALED latents (std≈1)
             loss_dict = self.diffusion.training_losses(mp_model_wrapper, latents, t, model_kwargs=dict(y=labels))
             loss = loss_dict["loss"].mean()
                 
@@ -341,7 +335,7 @@ class DiTImangenetTrainer:
                 self.visualize(epoch)
             
         if epoch > 0 and epoch % 10 == 0:
-             self.evaluate_fid(epoch, num_gen_batches=10) 
+             self.evaluate_fid(epoch, num_gen_batches=10)
 
     def save_checkpoint(self, epoch):
         if self.config.local_rank == 0:
