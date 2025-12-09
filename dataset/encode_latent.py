@@ -17,36 +17,29 @@ except ImportError:
     HAS_PYNVML = False
 
 def get_gpu_stats(local_rank, nvml_handle=None):
-    """
-    获取当前 GPU 的显存和利用率信息
-    """
+    """获取当前 GPU 的显存和利用率信息"""
     stats = {}
-    
-    # 1. 显存信息 (PyTorch Native, 最准确)
     mem_reserved = torch.cuda.memory_reserved() / 1024**3
     mem_allocated = torch.cuda.memory_allocated() / 1024**3
     stats['mem'] = f"{mem_allocated:.1f}/{mem_reserved:.1f}GB"
     
-    # 2. 利用率信息 (Optional, via pynvml)
     if nvml_handle:
         try:
             util = pynvml.nvmlDeviceGetUtilizationRates(nvml_handle)
             stats['util'] = f"{util.gpu}%"
         except Exception:
             stats['util'] = "N/A"
-            
     return stats
 
 def main():
-    parser = argparse.ArgumentParser(description="Encode ImageNet to Latents with Data Augmentation (DDP Support)")
+    parser = argparse.ArgumentParser(description="Encode ImageNet to Latents (Pre-calc for DiT)")
     parser.add_argument("--data_path", type=str, required=True, help="Path to raw ImageNet train directory")
     parser.add_argument("--save_path", type=str, required=True, help="Path to save latents")
     parser.add_argument("--image_size", type=int, default=256)
-    # [优化] 默认 Batch 增大到 32。对于 10 crops，实际 batch 是 320。H100 显存足够。
-    parser.add_argument("--batch_size", type=int, default=40, help="Number of *original images* per batch per GPU. (Actual input to VAE = batch_size * num_crops)")
-    parser.add_argument("--num_crops", type=int, default=10, help="Number of RandomResizedCrop augmentations per image")
-    # [优化] 默认 Worker 增大到 16，充分利用 H100 配套的高性能 CPU。
-    parser.add_argument("--num_workers", type=int, default=32, help="Workers per GPU")
+    # 建议: batch_size 可以设大一点，VAE 推理不怎么吃显存
+    parser.add_argument("--batch_size", type=int, default=32, help="Original images per batch per GPU") 
+    parser.add_argument("--num_crops", type=int, default=10, help="Number of crops per image")
+    parser.add_argument("--num_workers", type=int, default=16, help="Workers per GPU")
     args = parser.parse_args()
 
     # --- 1. DDP 初始化 ---
@@ -59,18 +52,15 @@ def main():
         torch.cuda.set_device(local_rank)
         device = torch.device(f"cuda:{local_rank}")
         is_main_process = (rank == 0)
-        
-        print(f"[Init] Global Rank {rank} | Local Rank {local_rank} | Device: {torch.cuda.current_device()} | Name: {torch.cuda.get_device_name(device)}")
     else:
         rank = 0
         world_size = 1
         local_rank = 0
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         is_main_process = True
-        print(f"[Init] Single Process Mode | Device: {device}")
 
     if is_main_process:
-        print(f"Global Rank 0: Initialized DDP with world_size={world_size}")
+        print(f"[Init] World Size: {world_size} | Device: {device}")
 
     # --- 监控初始化 ---
     nvml_handle = None
@@ -78,70 +68,73 @@ def main():
         try:
             pynvml.nvmlInit()
             nvml_handle = pynvml.nvmlDeviceGetHandleByIndex(local_rank)
-        except Exception as e:
-            print(f"Warning: Failed to initialize NVML for monitoring: {e}")
-            nvml_handle = None
+        except Exception:
+            pass
 
-    # --- 2. 准备 VAE & 编译优化 ---
+    # --- 2. 准备 VAE & 精度设置 ---
     if is_main_process:
-        print(f"Loading VAE to {device}...")
+        print(f"Loading VAE...")
     
-    # [优化] 开启 TF32 和 CuDNN Benchmark
+    # 开启 TF32
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
-    torch.backends.cudnn.benchmark = True # 针对固定输入尺寸寻找最优卷积算法
+    torch.backends.cudnn.benchmark = True
+
+    # 自动选择精度: H100/A100 优先使用 BFloat16 以防溢出，老卡使用 Float16
+    dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    if is_main_process:
+        print(f"Using precision: {dtype}")
 
     vae = AutoencoderKL.from_pretrained("stabilityai/sd-vae-ft-mse").to(device)
     vae.eval()
-
-    # [优化] 使用 torch.compile 编译模型
-    # mode="max-autotune" 在 H100 上通常能获得最佳推理吞吐量，但编译时间稍长
-    # mode="reduce-overhead" 启动更快，适合小 batch，但吞吐量可能略低
-    if is_main_process:
-        print("Compiling VAE with torch.compile (mode='max-autotune')...")
     
-    # 编译整个 VAE 可能会有动态控制流问题，通常只编译 VAE 的 Encode 部分或整个 VAE 模块
-    # 这里直接编译 vae，PyTorch 2.x 对此支持已经很好了
+    # 编译优化
+    # 注意: 如果遇到 RuntimeError，可以尝试注释掉这一行，或改为 mode='reduce-overhead'
+    if is_main_process:
+        print("Compiling VAE...")
     try:
         vae = torch.compile(vae, mode="max-autotune")
     except Exception as e:
-        print(f"Warning: torch.compile failed ({e}), falling back to eager mode.")
+        if is_main_process: print(f"Warning: torch.compile failed, using eager mode. {e}")
 
     # --- 3. 准备数据增强 ---
     crop_transform = transforms.Compose([
-        transforms.RandomResizedCrop(args.image_size, scale=(0.08, 1.0), interpolation=transforms.InterpolationMode.BICUBIC),
+        # [修改] 将 scale 下限从 0.08 提高到 0.25。
+        # 对于生成任务，太小的 crop 会导致 latent 只有纹理没有语义，影响 DiT 学习。
+        transforms.RandomResizedCrop(args.image_size, scale=(0.25, 1.0), interpolation=transforms.InterpolationMode.BICUBIC),
         transforms.RandomHorizontalFlip(),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
     ])
 
-    # --- 4. 扫描文件 & 数据分片 ---
+    # --- 4. 扫描文件 ---
     if is_main_process:
         print(f"Scanning files in {args.data_path}...")
     
     valid_exts = ('.jpg', '.jpeg', '.png', '.bmp', '.webp', '.tiff')
     image_paths = []
     
+    # 使用 os.scandir 通常比 os.walk 更快一点
     for root, _, files in os.walk(args.data_path):
         for fname in files:
             if fname.lower().endswith(valid_exts):
                 src_path = os.path.join(root, fname)
+                # 计算相对路径，用于保持输出目录结构
                 rel_path = os.path.relpath(src_path, args.data_path)
                 base_name = os.path.splitext(rel_path)[0]
                 dst_base = os.path.join(args.save_path, base_name)
                 image_paths.append((src_path, dst_base))
     
+    # 排序确保所有 GPU 拿到的列表顺序一致
     image_paths.sort(key=lambda x: x[0])
 
-    if is_main_process:
-        print(f"Found {len(image_paths)} total images.")
-    
+    # 数据分片
     my_paths = image_paths[rank::world_size]
     
     if is_main_process:
-        print(f"Each GPU processing approx {len(my_paths)} images.")
+        print(f"Total images: {len(image_paths)}. Each GPU processing: {len(my_paths)}")
 
-    # --- 5. 数据集定义 ---
+    # --- 5. Dataset ---
     class AugmentedDataset(Dataset):
         def __init__(self, paths, transform, num_crops):
             self.paths = paths
@@ -156,13 +149,14 @@ def main():
             try:
                 img = Image.open(src).convert("RGB")
                 crops = []
-                # 这里的循环是在 Worker 进程（CPU）中执行的
                 for _ in range(self.num_crops):
                     crops.append(self.transform(img))
+                # shape: [num_crops, 3, H, W]
                 img_tensor = torch.stack(crops)
                 return img_tensor, dst_base
             except Exception as e:
-                print(f"Rank {rank} Error loading {src}: {e}")
+                print(f"[Rank {rank}] Error loading {src}: {e}")
+                # 返回全黑图作为 fallback
                 return torch.zeros(self.num_crops, 3, args.image_size, args.image_size), dst_base
 
     dataset = AugmentedDataset(my_paths, crop_transform, args.num_crops)
@@ -172,47 +166,64 @@ def main():
         batch_size=args.batch_size, 
         shuffle=False, 
         num_workers=args.num_workers,
-        pin_memory=True, # [优化] 配合 .to(non_blocking=True) 实现异步传输
+        pin_memory=True,
         drop_last=False,
-        prefetch_factor=4, # [优化] 增加预取因子，让 CPU 跑得比 GPU 快
-        persistent_workers=True # [优化] 保持 Worker 进程存活，避免反复初始化
+        prefetch_factor=2, # 根据 CPU 性能调整
+        persistent_workers=True
     )
 
     # --- 6. 编码循环 ---
     if is_main_process:
-        print(f"Start encoding... (Batch: {args.batch_size} imgs * {args.num_crops} crops = {args.batch_size * args.num_crops} inputs/iter)")
+        print(f"Start encoding... Outputting Unscaled Latents (std≈5.5).")
     
     iterator = tqdm(loader, desc=f"GPU {rank}", disable=not is_main_process)
     
     with torch.no_grad():
         for i, (batch_imgs, batch_dst_bases) in enumerate(iterator):
+            # batch_imgs shape: [B, N, 3, H, W]
             B, N, C, H, W = batch_imgs.shape
             
-            # [优化] non_blocking=True 配合 pin_memory=True，实现 CPU->GPU 拷贝与 GPU 计算重叠
+            # Flatten 这里的维度，变成 [B*N, 3, H, W] 喂给 VAE
             flat_imgs = batch_imgs.view(-1, C, H, W).to(device, non_blocking=True)
             
-            with torch.amp.autocast('cuda', dtype=torch.float16):
-                # 第一次运行时 torch.compile 会进行 JIT 编译，可能会稍微卡一下
+            with torch.amp.autocast('cuda', dtype=dtype):
+                # 编码
                 dist_post = vae.encode(flat_imgs).latent_dist
-                latents = dist_post.sample()
+                
+                # [核心修改 1] 使用 mode() 取均值，不要 sample()
+                # 因为我们要离线保存，sample() 会导致噪声被“冻结”，这是错误的。
+                latents = dist_post.mode() 
+                
+                # [核心修改 2] 不乘 0.18215
+                # 根据你的需求，我们在训练时的 Loader 里进行缩放。
+                # 此时 latents 的 std 约为 5.5
             
+            # 移回 CPU 并恢复维度: [B, N, 4, h, w]
             latents = latents.cpu()
             latents = latents.view(B, N, *latents.shape[1:])
             
+            # 保存循环
             for k, dst_base in enumerate(batch_dst_bases):
                 try:
-                    os.makedirs(os.path.dirname(dst_base), exist_ok=True)
-                    for j in range(N):
-                        save_path = f"{dst_base}_{j}.pt"
-                        torch.save(latents[k, j].clone(), save_path)
-                except OSError:
-                    pass
+                    save_dir = os.path.dirname(dst_base)
+                    os.makedirs(save_dir, exist_ok=True)
+                    
+                    # [核心修改 3] 将一张图的所有 crops 存为一个文件
+                    # 文件路径: .../n01440764/n01440764_10026.pt
+                    # Tensor Shape: [10, 4, 32, 32]
+                    # 避免生成千万级小文件导致 Inode 耗尽
+                    save_path = f"{dst_base}.pt"
+                    torch.save(latents[k].clone(), save_path)
+                    
+                except OSError as e:
+                    print(f"Error saving {dst_base}: {e}")
             
-            if is_main_process and i % 5 == 0:
+            # 打印监控日志
+            if is_main_process and i % 10 == 0:
                 stats = get_gpu_stats(local_rank, nvml_handle)
-                postfix_str = f"Mem:{stats.get('mem')} "
+                postfix_str = f"Mem:{stats.get('mem')}"
                 if 'util' in stats:
-                    postfix_str += f"Util:{stats.get('util')}"
+                    postfix_str += f" | Util:{stats.get('util')}"
                 iterator.set_postfix_str(postfix_str)
 
     if is_main_process:
