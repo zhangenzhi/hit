@@ -75,6 +75,14 @@ class DiTImangenetTrainer:
         if config.local_rank == 0:
             print(f"Training with AMP: {self.use_amp}, Dtype: {self.dtype}")
             print(f"EMA initialized with decay: {self.ema.decay}")
+        
+        # 编译优化 (可根据需要开启)
+        try:
+            self.model = torch.compile(self.model, mode="default")
+            if config.local_rank == 0:
+                print("Model compiled with torch.compile")
+        except Exception as e:
+            print(f"Warning: torch.compile failed: {e}")
 
         self.fid_metric = None
         try:
@@ -357,7 +365,7 @@ class DiTImangenetTrainer:
 
     def resume_checkpoint(self, checkpoint_path):
         print(f"Loading checkpoint from {checkpoint_path}...")
-        checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
+        checkpoint = torch.load(checkpoint_path, map_location=self.device)
         
         model_state_dict = checkpoint["model"]
         if self.config.use_ddp:
