@@ -3,7 +3,7 @@
 #PBS -q sg
 #PBS -l select=2:ngpus=8
 #PBS -l walltime=30:00
-#PBS -W group_list=group1
+#PBS -W group_list=c30636
 #PBS -j oe
 
 
