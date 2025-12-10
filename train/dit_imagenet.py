@@ -149,8 +149,7 @@ class DiTImangenetTrainer:
             # Predict x0 (in SCALED space)
             pred_x0 = (x - torch.sqrt(1 - alpha_bar_t) * eps) / torch.sqrt(alpha_bar_t)
             
-            # [FIX] 防止数值爆炸，放宽到 [-10, 10]
-            pred_x0 = pred_x0.clamp(-10.0, 10.0)
+            pred_x0 = pred_x0.clamp(-3.0, 3.0)
             
             dir_xt = torch.sqrt(1 - alpha_bar_t_prev - sigma_t**2) * eps
             noise = sigma_t * torch.randn_like(x)
