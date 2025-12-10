@@ -6,6 +6,7 @@
 #PBS -W group_list=group1
 #PBS -j oe
 
-cd ${PBS_O_WORKDIR}
+
+cd /work/c30636/hit
 
 torchrun --nnodes=2 --nproc_per_node=4 ./main.py --config ./configs/dit-b_IN1K.yaml
