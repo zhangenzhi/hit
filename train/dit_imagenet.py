@@ -75,14 +75,6 @@ class DiTImangenetTrainer:
         if config.local_rank == 0:
             print(f"Training with AMP: {self.use_amp}, Dtype: {self.dtype}")
             print(f"EMA initialized with decay: {self.ema.decay}")
-        
-        # 编译优化 (可根据需要开启)
-        try:
-            self.model = torch.compile(self.model, mode="default")
-            if config.local_rank == 0:
-                print("Model compiled with torch.compile")
-        except Exception as e:
-            print(f"Warning: torch.compile failed: {e}")
 
         self.fid_metric = None
         try:
@@ -147,11 +139,9 @@ class DiTImangenetTrainer:
             sigma_t = eta * torch.sqrt((1 - alpha_bar_t_prev) / (1 - alpha_bar_t) * (1 - alpha_bar_t / alpha_bar_t_prev))
             
             # Predict x0 (in SCALED space)
-            # [WARNING] 当 t 很大(alpha_bar_t很小)时，此处除法会导致数值爆炸，尤其是在模型未训练好时
             pred_x0 = (x - torch.sqrt(1 - alpha_bar_t) * eps) / torch.sqrt(alpha_bar_t)
             
-            # [FIX] 对 pred_x0 进行截断。Latent (std=1) 的正常范围在 [-3, 3] 左右。
-            # 这能有效防止 Epoch 0 时的数值爆炸 (你的 Std: 19708 就是这里导致的)。
+            # [FIX] 防止数值爆炸，放宽到 [-10, 10]
             pred_x0 = pred_x0.clamp(-10.0, 10.0)
             
             dir_xt = torch.sqrt(1 - alpha_bar_t_prev - sigma_t**2) * eps
@@ -170,18 +160,15 @@ class DiTImangenetTrainer:
         
         try:
             # --- 1. Sanity Check: Visualize REAL Reconstruction ---
-            # 这步非常关键：如果不通过，说明是 VAE 或者是 Scaling 问题
             try:
                 real_batch, _ = next(iter(self.loader))
                 real_batch = real_batch[:4].to(self.device)
                 
-                # 如果是 Latent (4通道)，直接解码
                 if real_batch.shape[1] == 4:
-                    # Real Latents (std=5.5) -> Image
-                    # 注意：这里不需要 / 0.18215，因为 Dataset 返回的就是 Unscaled
+                    # Latent
                     recon_real = self.vae.decode(real_batch.float()).sample.float()
                 else:
-                    # 如果是 Pixel，先 Encode 再 Decode
+                    # Pixel
                     post = self.vae.encode(real_batch.float()).latent_dist
                     recon_real = self.vae.decode(post.sample()).sample.float()
                 
@@ -190,7 +177,6 @@ class DiTImangenetTrainer:
                 
                 recon_path = os.path.join(self.config.results_dir, f"recon_sanity_epoch_{epoch}.png")
                 save_image(recon_vis, recon_path, nrow=2)
-                print(f"[Visual] Saved REAL reconstruction to {recon_path} (Check this if generated images are wrong!)")
             except Exception as e:
                 print(f"[Visual] Reconstruction Sanity Check Failed: {e}")
 
@@ -203,9 +189,6 @@ class DiTImangenetTrainer:
 
             z = self.sample_ddim(n_samples, labels, latent_size, num_inference_steps=50, cfg_scale=1.5, model=self.model)
             z = z.float()
-            
-            # 打印生成 Latent 的统计信息，确保它不是全是 0 或者全是 NaN
-            print(f"[Visual] Generated Latent Stats | Mean: {z.mean():.4f} | Std: {z.std():.4f} | Min: {z.min():.4f} | Max: {z.max():.4f}")
             
             # Correct Unscaling: std=1 -> std=5.5
             x_recon = self.vae.decode(z / 0.18215).sample.float()
@@ -231,6 +214,13 @@ class DiTImangenetTrainer:
         self.ema.apply_shadow()
         self.model.eval()
         self.fid_metric.reset()
+        
+        # [OOM Fix] 强制清理显存，缓解碎片化
+        torch.cuda.empty_cache()
+
+        # [OOM Fix] 切片解码：定义 VAE 解码时的 Mini-Batch 大小
+        # H100上 32-64 是安全的，能将峰值显存降低数倍
+        vae_batch_size = 32
 
         try:
             loader_iter = iter(self.loader)
@@ -240,10 +230,19 @@ class DiTImangenetTrainer:
                 except StopIteration:
                     break
                 real_imgs = real_imgs.to(self.device)
+                
+                # --- Real Images Decoding (Sliced) ---
                 if real_imgs.shape[1] == 4:
                     real_imgs = real_imgs.float()
-                    # Real Latents (std=5.5) -> Image
-                    real_imgs = self.vae.decode(real_imgs).sample.float()
+                    # 分块解码防止 OOM
+                    decoded_list = []
+                    for k in range(0, real_imgs.shape[0], vae_batch_size):
+                        batch_slice = real_imgs[k : k + vae_batch_size]
+                        # Real latents are unscaled (std=5.5), decode directly
+                        decoded_slice = self.vae.decode(batch_slice).sample.float()
+                        decoded_list.append(decoded_slice)
+                    real_imgs = torch.cat(decoded_list, dim=0)
+                
                 real_imgs = real_imgs.clamp(-1, 1)
                 real_imgs_uint8 = self._normalize_images(real_imgs)
                 self.fid_metric.update(real_imgs_uint8, real=True)
@@ -255,11 +254,20 @@ class DiTImangenetTrainer:
                 input_size = getattr(self.config, 'input_size', 32)
                 latent_size = (in_channels, input_size, input_size)
                 
+                # DiT 采样 (Latent空间，256 batch 没问题)
                 z = self.sample_ddim(n_samples, labels, latent_size, num_inference_steps=50, cfg_scale=1.5, model=self.model)
                 z = z.float()
                 
-                # Fake Latents (std=1) -> Unscaled (std=5.5) -> Image
-                fake_imgs = self.vae.decode(z / 0.18215).sample.float()
+                # --- Fake Images Decoding (Sliced) ---
+                # 同样对生成的假图进行分块解码
+                decoded_list = []
+                for k in range(0, z.shape[0], vae_batch_size):
+                    z_slice = z[k : k + vae_batch_size]
+                    # Fake latents are scaled (std=1), need unscale
+                    decoded_slice = self.vae.decode(z_slice / 0.18215).sample.float()
+                    decoded_list.append(decoded_slice)
+                
+                fake_imgs = torch.cat(decoded_list, dim=0)
                 fake_imgs = fake_imgs.clamp(-1, 1)
                 
                 fake_imgs_uint8 = self._normalize_images(fake_imgs)
@@ -273,6 +281,7 @@ class DiTImangenetTrainer:
         finally:
             self.ema.restore()
             self.model.train()
+            # 再次清理显存
             torch.cuda.empty_cache()
         if self.config.use_ddp:
             dist.barrier()
@@ -348,7 +357,7 @@ class DiTImangenetTrainer:
 
     def resume_checkpoint(self, checkpoint_path):
         print(f"Loading checkpoint from {checkpoint_path}...")
-        checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
+        checkpoint = torch.load(checkpoint_path, map_location=self.device)
         
         model_state_dict = checkpoint["model"]
         if self.config.use_ddp:
