@@ -152,7 +152,7 @@ class DiTImangenetTrainer:
             
             # [FIX] 对 pred_x0 进行截断。Latent (std=1) 的正常范围在 [-3, 3] 左右。
             # 这能有效防止 Epoch 0 时的数值爆炸 (你的 Std: 19708 就是这里导致的)。
-            pred_x0 = pred_x0.clamp(-3.0, 3.0)
+            pred_x0 = pred_x0.clamp(-10.0, 10.0)
             
             dir_xt = torch.sqrt(1 - alpha_bar_t_prev - sigma_t**2) * eps
             noise = sigma_t * torch.randn_like(x)
