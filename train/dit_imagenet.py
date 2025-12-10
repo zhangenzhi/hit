@@ -357,7 +357,7 @@ class DiTImangenetTrainer:
 
     def resume_checkpoint(self, checkpoint_path):
         print(f"Loading checkpoint from {checkpoint_path}...")
-        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+        checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
         
         model_state_dict = checkpoint["model"]
         if self.config.use_ddp:
