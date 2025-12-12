@@ -46,7 +46,8 @@ class EMA:
         self.backup = {}
 
 class DiTImangenetTrainer:
-    def __init__(self, model, diffusion, vae, loader, config):
+    # [Modify] 增加 val_loader 参数，默认为 None 以保持兼容性
+    def __init__(self, model, diffusion, vae, loader, val_loader, config):
         self.config = config
         self.device = torch.device(f"cuda:{config.local_rank}")
         
@@ -65,18 +66,22 @@ class DiTImangenetTrainer:
             weight_decay=0.0
         )
         self.loader = loader
+        self.val_loader = val_loader # [New] 保存验证集 Loader
         
         self.use_amp = getattr(config, 'use_amp', True)
         self.dtype = torch.bfloat16 if self.use_amp else torch.float32
 
-        # GradScaler: 推荐保留，增强鲁棒性
         self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp)
         
         if config.local_rank == 0:
             print(f"Training with AMP: {self.use_amp}, Dtype: {self.dtype}")
             print(f"EMA initialized with decay: {self.ema.decay}")
+            if self.val_loader is not None:
+                print("Validation Loader provided. FID will be calculated on VALIDATION set (Correct Protocol).")
+            else:
+                print("WARNING: No Validation Loader provided. FID will be calculated on TRAINING set (Biased Protocol).")
         
-        # 编译优化 (可根据需要开启)
+        # 编译优化
         try:
             self.model = torch.compile(self.model, mode="default")
             if config.local_rank == 0:
@@ -146,10 +151,11 @@ class DiTImangenetTrainer:
             
             sigma_t = eta * torch.sqrt((1 - alpha_bar_t_prev) / (1 - alpha_bar_t) * (1 - alpha_bar_t / alpha_bar_t_prev))
             
-            # Predict x0 (in SCALED space)
+            # Predict x0
             pred_x0 = (x - torch.sqrt(1 - alpha_bar_t) * eps) / torch.sqrt(alpha_bar_t)
             
-            pred_x0 = pred_x0.clamp(-3.0, 3.0)
+            # [FIX] 防止数值爆炸，范围放宽到 [-10, 10]
+            pred_x0 = pred_x0.clamp(-10.0, 10.0)
             
             dir_xt = torch.sqrt(1 - alpha_bar_t_prev - sigma_t**2) * eps
             noise = sigma_t * torch.randn_like(x)
@@ -168,14 +174,14 @@ class DiTImangenetTrainer:
         try:
             # --- 1. Sanity Check: Visualize REAL Reconstruction ---
             try:
-                real_batch, _ = next(iter(self.loader))
+                # 优先从 val_loader 取样
+                loader_to_use = self.val_loader if self.val_loader is not None else self.loader
+                real_batch, _ = next(iter(loader_to_use))
                 real_batch = real_batch[:4].to(self.device)
                 
                 if real_batch.shape[1] == 4:
-                    # Latent
                     recon_real = self.vae.decode(real_batch.float()).sample.float()
                 else:
-                    # Pixel
                     post = self.vae.encode(real_batch.float()).latent_dist
                     recon_real = self.vae.decode(post.sample()).sample.float()
                 
@@ -194,10 +200,10 @@ class DiTImangenetTrainer:
             input_size = getattr(self.config, 'input_size', 32)
             latent_size = (in_channels, input_size, input_size)
 
-            z = self.sample_ddim(n_samples, labels, latent_size, num_inference_steps=50, cfg_scale=1.5, model=self.model)
+            # [Modify] 提高 cfg_scale 到 4.0
+            z = self.sample_ddim(n_samples, labels, latent_size, num_inference_steps=50, cfg_scale=4.0, model=self.model)
             z = z.float()
             
-            # Correct Unscaling: std=1 -> std=5.5
             x_recon = self.vae.decode(z / 0.18215).sample.float()
             
             x_recon = x_recon.clamp(-1, 1)
@@ -222,30 +228,31 @@ class DiTImangenetTrainer:
         self.model.eval()
         self.fid_metric.reset()
         
-        # [OOM Fix] 强制清理显存，缓解碎片化
         torch.cuda.empty_cache()
-
-        # [OOM Fix] 切片解码：定义 VAE 解码时的 Mini-Batch 大小
-        # H100上 32-64 是安全的，能将峰值显存降低数倍
         vae_batch_size = 32
 
+        # [Modify] 关键逻辑：使用验证集进行 FID 评估
+        # 如果 self.val_loader 存在，则使用它；否则回退到 self.loader (并已在 init 打印警告)
+        loader_to_use = self.val_loader if self.val_loader is not None else self.loader
+        loader_iter = iter(loader_to_use)
+
         try:
-            loader_iter = iter(self.loader)
             for i in range(num_gen_batches):
                 try:
                     real_imgs, _ = next(loader_iter)
                 except StopIteration:
-                    break
+                    # 如果验证集遍历完了，重新开始
+                    loader_iter = iter(loader_to_use)
+                    real_imgs, _ = next(loader_iter)
+                    
                 real_imgs = real_imgs.to(self.device)
                 
                 # --- Real Images Decoding (Sliced) ---
                 if real_imgs.shape[1] == 4:
                     real_imgs = real_imgs.float()
-                    # 分块解码防止 OOM
                     decoded_list = []
                     for k in range(0, real_imgs.shape[0], vae_batch_size):
                         batch_slice = real_imgs[k : k + vae_batch_size]
-                        # Real latents are unscaled (std=5.5), decode directly
                         decoded_slice = self.vae.decode(batch_slice).sample.float()
                         decoded_list.append(decoded_slice)
                     real_imgs = torch.cat(decoded_list, dim=0)
@@ -253,6 +260,9 @@ class DiTImangenetTrainer:
                 real_imgs = real_imgs.clamp(-1, 1)
                 real_imgs_uint8 = self._normalize_images(real_imgs)
                 self.fid_metric.update(real_imgs_uint8, real=True)
+                
+                if i == 0 and self.config.local_rank == 0:
+                    print(f"[FID] Real Imgs Mean: {real_imgs.mean().item():.4f}, Std: {real_imgs.std().item():.4f}")
             
             for i in range(num_gen_batches):
                 n_samples = self.config.batch_size
@@ -261,16 +271,14 @@ class DiTImangenetTrainer:
                 input_size = getattr(self.config, 'input_size', 32)
                 latent_size = (in_channels, input_size, input_size)
                 
-                # DiT 采样 (Latent空间，256 batch 没问题)
-                z = self.sample_ddim(n_samples, labels, latent_size, num_inference_steps=50, cfg_scale=1.5, model=self.model)
+                # [Modify] 提高 cfg_scale 到 4.0
+                z = self.sample_ddim(n_samples, labels, latent_size, num_inference_steps=50, cfg_scale=4.0, model=self.model)
                 z = z.float()
                 
                 # --- Fake Images Decoding (Sliced) ---
-                # 同样对生成的假图进行分块解码
                 decoded_list = []
                 for k in range(0, z.shape[0], vae_batch_size):
                     z_slice = z[k : k + vae_batch_size]
-                    # Fake latents are scaled (std=1), need unscale
                     decoded_slice = self.vae.decode(z_slice / 0.18215).sample.float()
                     decoded_list.append(decoded_slice)
                 
@@ -279,6 +287,9 @@ class DiTImangenetTrainer:
                 
                 fake_imgs_uint8 = self._normalize_images(fake_imgs)
                 self.fid_metric.update(fake_imgs_uint8, real=False)
+                
+                if i == 0 and self.config.local_rank == 0:
+                    print(f"[FID] Fake Imgs Mean: {fake_imgs.mean().item():.4f}, Std: {fake_imgs.std().item():.4f}")
             
             fid_score = self.fid_metric.compute()
             if self.config.local_rank == 0:
@@ -288,7 +299,6 @@ class DiTImangenetTrainer:
         finally:
             self.ema.restore()
             self.model.train()
-            # 再次清理显存
             torch.cuda.empty_cache()
         if self.config.use_ddp:
             dist.barrier()
@@ -364,7 +374,7 @@ class DiTImangenetTrainer:
 
     def resume_checkpoint(self, checkpoint_path):
         print(f"Loading checkpoint from {checkpoint_path}...")
-        checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
+        checkpoint = torch.load(checkpoint_path, map_location=self.device)
         
         model_state_dict = checkpoint["model"]
         if self.config.use_ddp:

@@ -108,6 +108,7 @@ def main():
     # 自动决定是返回 ImageFolder (Pixel) 还是 LatentFolder (Latent)
     loaders = build_dit_dataloaders(flat_config)
     train_loader = loaders['train']
+    val_loader = loaders['val'] # 获取验证集 Loader
 
     # 5. 初始化 VAE (即使是 Latent 模式，为了 FID 评估的 Decode 阶段，VAE 依然需要)
     if flat_config.local_rank == 0:
@@ -149,7 +150,8 @@ def main():
     if flat_config.local_rank == 0:
         print("Start Training...")
         
-    trainer = DiTImangenetTrainer(model, diffusion, vae, train_loader, flat_config)
+    # 传入 val_loader 给 Trainer
+    trainer = DiTImangenetTrainer(model, diffusion, vae, train_loader, val_loader, flat_config)
 
     # 检查恢复训练
     start_epoch = 0
