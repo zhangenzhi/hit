@@ -132,7 +132,7 @@ def main():
         hidden_size=config.model.hidden_size,
         depth=config.model.depth,
         num_heads=config.model.num_heads,
-        # learn_sigma=config.model.learn_sigma, # 你的新 DiT 实现可能没有这个参数，如果是标准 DiT 则内置了
+        learn_sigma=config.model.learn_sigma, # 你的新 DiT 实现可能没有这个参数，如果是标准 DiT 则内置了
         class_dropout_prob=0.1,
         num_classes=config.model.num_classes
     )
