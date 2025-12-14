@@ -195,7 +195,7 @@ class GaussianDiffusion:
                 x_start=x_start,
                 x_t=x_t,
                 t=t,
-                clip_denoised=False, 
+                clip_denoised=True, 
             )["output"]
             
             # [CRITICAL FIX] Use 1e-3 weight for VLB loss.
