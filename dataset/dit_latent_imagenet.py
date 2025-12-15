@@ -5,15 +5,11 @@ import random
 from torchvision import datasets
 from torch.utils.data import DataLoader, DistributedSampler, Dataset
 
-# [Fix 2] Fallback 形状修正
-# 假设预处理时 num_crops=10。如果不确定，这里返回 None，在 getitem 里处理会更稳健
+# [修复 1] 移除 try-except 掩盖错误的逻辑
+# 如果文件损坏或路径错误，必须报错终止训练，而不是喂给模型全 0 数据！
 def robust_loader(path):
-    try:
-        # map_location='cpu' 避免多线程加载时占用过多 GPU 显存
-        return torch.load(path, map_location='cpu')
-    except Exception as e:
-        print(f"Error loading {path}: {e}")
-        return None  # 返回 None，让 Dataset 处理
+    # map_location='cpu' 避免多线程加载时占用过多 GPU 显存
+    return torch.load(path, map_location='cpu')
 
 class LatentFolder(datasets.DatasetFolder):
     """
@@ -31,25 +27,24 @@ class LatentFolder(datasets.DatasetFolder):
 
     def __getitem__(self, index):
         path, target = self.samples[index]
+        
+        # [修复 2] 直接加载，如果失败让它报错
         sample = self.loader(path)
         
-        # [Fix 2] 处理加载失败的情况 (Fallback)
-        if sample is None:
-            # 假设标准尺寸，这里需要根据你的实际 Latent 尺寸硬编码或者动态获取
-            # 如果 sample 为 None，我们生成一个全0的 latent 避免崩溃
-            # 注意：这里的形状是最终喂给模型的形状 [4, 32, 32]
-            return torch.zeros(4, 32, 32), target
-
-        # [Fix 1] 处理多 Crop 维度 [Num_Crops, C, H, W] -> [C, H, W]
+        # [修复 3] 处理维度
+        # 情况 A: 训练集生成的 .pt 通常是 [Num_Crops, C, H, W] (例如 [10, 4, 32, 32])
+        # 情况 B: 验证集生成的 .pt 应该是 [1, C, H, W] 或 [C, H, W] (Center Crop)
         if sample.dim() == 4: 
             num_crops = sample.shape[0]
             if self.is_train:
-                # 训练时：随机选一个 crop，实现数据增强效果
+                # 训练时：随机选一个 crop，实现数据增强
                 idx = random.randint(0, num_crops - 1)
                 sample = sample[idx]
             else:
-                # 验证时：固定选第一个，保证验证指标稳定
-                # (前提是所有样本也是这样处理的)
+                # 验证时：
+                # 如果你的验证集 .pt 包含多个随机 crop，这里取第一个会导致 FID 虚高。
+                # 正确做法是：重新生成验证集，使其只包含 1 个 Center Crop。
+                # 这里取 0 是为了兼容，但请务必重跑 encode_latent.py
                 sample = sample[0]
         
         # 此时 sample 形状应为 [4, 32, 32]
@@ -78,13 +73,16 @@ def build_dit_dataloaders(args):
     train_root = os.path.join(data_dir, 'train')
     val_root = os.path.join(data_dir, 'val')
     
+    # 简单的检查，如果 train 目录不存在则回退到 data_dir 本身 (兼容非标准结构)
     if not os.path.exists(train_root):
+        if rank == 0: print(f"Warning: {train_root} not found, using {data_dir} as train root.")
         train_root = data_dir
         val_root = None 
 
     # --- 自动检测模式 ---
     is_latent = False
     try:
+        # 扫描第一个子文件夹看是否有 .pt 文件
         with os.scandir(train_root) as it:
             first_entry = next(it)
             if first_entry.is_dir():
@@ -103,12 +101,16 @@ def build_dit_dataloaders(args):
 
     # --- 构建 Dataset ---
     if is_latent:
-        # [Modify] 传入 is_train 标志
         train_dataset = LatentFolder(train_root, is_train=True)
-        val_dataset = LatentFolder(val_root, is_train=False) if (val_root and os.path.exists(val_root)) else None
+        # 如果 val_root 存在且有内容，则加载验证集
+        if val_root and os.path.exists(val_root):
+            val_dataset = LatentFolder(val_root, is_train=False)
+        else:
+            val_dataset = None
+            if rank == 0: print("Warning: No validation dataset found or path invalid.")
         
     else:
-        # Pixel 模式：保持原样
+        # Pixel 模式：保持原样 (用于 Debug 或小数据集)
         from torchvision import transforms
         
         if isinstance(model_conf, dict) and 'image_size' in model_conf:
@@ -123,6 +125,7 @@ def build_dit_dataloaders(args):
             transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
         ])
         
+        # 验证集必须是 CenterCrop
         val_transform = transforms.Compose([
             transforms.Resize(img_size, interpolation=transforms.InterpolationMode.BICUBIC),
             transforms.CenterCrop(img_size),

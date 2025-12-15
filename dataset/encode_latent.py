@@ -36,10 +36,13 @@ def main():
     parser.add_argument("--data_path", type=str, required=True, help="Path to raw ImageNet train directory")
     parser.add_argument("--save_path", type=str, required=True, help="Path to save latents")
     parser.add_argument("--image_size", type=int, default=256)
-    # 建议: batch_size 可以设大一点，VAE 推理不怎么吃显存
     parser.add_argument("--batch_size", type=int, default=32, help="Original images per batch per GPU") 
-    parser.add_argument("--num_crops", type=int, default=10, help="Number of crops per image")
+    parser.add_argument("--num_crops", type=int, default=10, help="Number of crops per image (only for random crop)")
     parser.add_argument("--num_workers", type=int, default=16, help="Workers per GPU")
+    
+    # [新增] 关键参数：控制验证集生成模式
+    parser.add_argument("--center_crop", action="store_true", help="Use CenterCrop (for Validation Set). Sets num_crops=1.")
+    
     args = parser.parse_args()
 
     # --- 1. DDP 初始化 ---
@@ -75,12 +78,10 @@ def main():
     if is_main_process:
         print(f"Loading VAE...")
     
-    # 开启 TF32
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     torch.backends.cudnn.benchmark = True
 
-    # 自动选择精度: H100/A100 优先使用 BFloat16 以防溢出，老卡使用 Float16
     dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
     if is_main_process:
         print(f"Using precision: {dtype}")
@@ -88,8 +89,6 @@ def main():
     vae = AutoencoderKL.from_pretrained("stabilityai/sd-vae-ft-mse").to(device)
     vae.eval()
     
-    # 编译优化
-    # 注意: 如果遇到 RuntimeError，可以尝试注释掉这一行，或改为 mode='reduce-overhead'
     if is_main_process:
         print("Compiling VAE...")
     try:
@@ -97,15 +96,26 @@ def main():
     except Exception as e:
         if is_main_process: print(f"Warning: torch.compile failed, using eager mode. {e}")
 
-    # --- 3. 准备数据增强 ---
-    crop_transform = transforms.Compose([
-        # [修改] 将 scale 下限从 0.08 提高到 0.25。
-        # 对于生成任务，太小的 crop 会导致 latent 只有纹理没有语义，影响 DiT 学习。
-        transforms.RandomResizedCrop(args.image_size, scale=(0.25, 1.0), interpolation=transforms.InterpolationMode.BICUBIC),
-        transforms.RandomHorizontalFlip(),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
-    ])
+    # --- 3. 准备数据增强 (区分 训练/验证) ---
+    if args.center_crop:
+        if is_main_process: print("Mode: Validation (Center Crop, 1 Crop/Img)")
+        # [新增] 验证集标准预处理
+        transform = transforms.Compose([
+            transforms.Resize(args.image_size, interpolation=transforms.InterpolationMode.BICUBIC),
+            transforms.CenterCrop(args.image_size),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
+        ])
+        args.num_crops = 1 # 验证集只需要一张
+    else:
+        if is_main_process: print(f"Mode: Training (Random Crop, {args.num_crops} Crops/Img)")
+        # [原有] 训练集增强
+        transform = transforms.Compose([
+            transforms.RandomResizedCrop(args.image_size, scale=(0.25, 1.0), interpolation=transforms.InterpolationMode.BICUBIC),
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
+        ])
 
     # --- 4. 扫描文件 ---
     if is_main_process:
@@ -114,21 +124,16 @@ def main():
     valid_exts = ('.jpg', '.jpeg', '.png', '.bmp', '.webp', '.tiff')
     image_paths = []
     
-    # 使用 os.scandir 通常比 os.walk 更快一点
     for root, _, files in os.walk(args.data_path):
         for fname in files:
             if fname.lower().endswith(valid_exts):
                 src_path = os.path.join(root, fname)
-                # 计算相对路径，用于保持输出目录结构
                 rel_path = os.path.relpath(src_path, args.data_path)
                 base_name = os.path.splitext(rel_path)[0]
                 dst_base = os.path.join(args.save_path, base_name)
                 image_paths.append((src_path, dst_base))
     
-    # 排序确保所有 GPU 拿到的列表顺序一致
     image_paths.sort(key=lambda x: x[0])
-
-    # 数据分片
     my_paths = image_paths[rank::world_size]
     
     if is_main_process:
@@ -155,11 +160,12 @@ def main():
                 img_tensor = torch.stack(crops)
                 return img_tensor, dst_base
             except Exception as e:
+                # 打印完整错误路径，方便排查坏图
                 print(f"[Rank {rank}] Error loading {src}: {e}")
-                # 返回全黑图作为 fallback
+                # 返回全黑图，但通常建议在这里记录日志以便后续删除坏图
                 return torch.zeros(self.num_crops, 3, args.image_size, args.image_size), dst_base
 
-    dataset = AugmentedDataset(my_paths, crop_transform, args.num_crops)
+    dataset = AugmentedDataset(my_paths, transform, args.num_crops)
     
     loader = DataLoader(
         dataset, 
@@ -168,7 +174,7 @@ def main():
         num_workers=args.num_workers,
         pin_memory=True,
         drop_last=False,
-        prefetch_factor=2, # 根据 CPU 性能调整
+        prefetch_factor=2, 
         persistent_workers=True
     )
 
@@ -183,22 +189,14 @@ def main():
             # batch_imgs shape: [B, N, 3, H, W]
             B, N, C, H, W = batch_imgs.shape
             
-            # Flatten 这里的维度，变成 [B*N, 3, H, W] 喂给 VAE
             flat_imgs = batch_imgs.view(-1, C, H, W).to(device, non_blocking=True)
             
             with torch.amp.autocast('cuda', dtype=dtype):
-                # 编码
+                # 编码: 使用 mode() 取均值
                 dist_post = vae.encode(flat_imgs).latent_dist
-                
-                # [核心修改 1] 使用 mode() 取均值，不要 sample()
-                # 因为我们要离线保存，sample() 会导致噪声被“冻结”，这是错误的。
                 latents = dist_post.mode() 
-                
-                # [核心修改 2] 不乘 0.18215
-                # 根据你的需求，我们在训练时的 Loader 里进行缩放。
-                # 此时 latents 的 std 约为 5.5
             
-            # 移回 CPU 并恢复维度: [B, N, 4, h, w]
+            # 移回 CPU: [B, N, 4, h, w]
             latents = latents.cpu()
             latents = latents.view(B, N, *latents.shape[1:])
             
@@ -208,17 +206,14 @@ def main():
                     save_dir = os.path.dirname(dst_base)
                     os.makedirs(save_dir, exist_ok=True)
                     
-                    # [核心修改 3] 将一张图的所有 crops 存为一个文件
-                    # 文件路径: .../n01440764/n01440764_10026.pt
-                    # Tensor Shape: [10, 4, 32, 32]
-                    # 避免生成千万级小文件导致 Inode 耗尽
                     save_path = f"{dst_base}.pt"
+                    # 如果是 Center Crop，latents[k] 是 [1, 4, 32, 32]，保存即可
+                    # 如果是 Random Crop，latents[k] 是 [10, 4, 32, 32]
                     torch.save(latents[k].clone(), save_path)
                     
                 except OSError as e:
                     print(f"Error saving {dst_base}: {e}")
             
-            # 打印监控日志
             if is_main_process and i % 10 == 0:
                 stats = get_gpu_stats(local_rank, nvml_handle)
                 postfix_str = f"Mem:{stats.get('mem')}"

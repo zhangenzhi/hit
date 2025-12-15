@@ -159,9 +159,6 @@ class DiTImangenetTrainer:
             
             sigma_t = eta * torch.sqrt((1 - alpha_bar_t_prev) / (1 - alpha_bar_t) * (1 - alpha_bar_t / alpha_bar_t_prev))
             
-            # --- [关键回归] 移除截断 (No Clamp) ---
-            # 因为避开了 t=999，这里不会除以 0，数值稳定
-            # 不截断意味着保留了 latent 尾部的极值，这对纹理锐度至关重要
             pred_x0 = (x - torch.sqrt(1 - alpha_bar_t) * eps) / torch.sqrt(alpha_bar_t)
             
             dir_xt = torch.sqrt(1 - alpha_bar_t_prev - sigma_t**2) * eps
