@@ -184,9 +184,9 @@ class GaussianDiffusion:
         terms = {}
         model_output = model(x_t, t, **model_kwargs)
 
-        # B, C = x_t.shape[:2]
+        B, C = x_t.shape[:2]
         # if model_output.shape[1] == 2 * C:
-        #     model_output, model_var_values = th.split(model_output, C, dim=1)
+        model_output, model_var_values = th.split(model_output, C, dim=1)
         #     frozen_out = th.cat([model_output.detach(), model_var_values], dim=1)
             
         #     # [FIX] Ensure clip_denoised=False for VLB calculation on latents
