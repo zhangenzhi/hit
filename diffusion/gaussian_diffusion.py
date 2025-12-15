@@ -206,7 +206,8 @@ class GaussianDiffusion:
         terms["mse"] = mean_flat((target - model_output) ** 2)
         
         if "vb" in terms:
-            terms["loss"] = terms["mse"] + terms["vb"]
+            # terms["loss"] = terms["mse"] + terms["vb"]
+            terms["loss"] = terms["mse"]
         else:
             terms["loss"] = terms["mse"]
 
