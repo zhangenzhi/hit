@@ -46,7 +46,6 @@ class EMA:
         self.backup = {}
 
 class DiTImangenetTrainer:
-    # [Modify] 增加 val_loader 参数，默认为 None 以保持兼容性
     def __init__(self, model, diffusion, vae, loader, val_loader, config):
         self.config = config
         self.device = torch.device(f"cuda:{config.local_rank}")
@@ -66,22 +65,22 @@ class DiTImangenetTrainer:
             weight_decay=0.0
         )
         self.loader = loader
-        self.val_loader = val_loader # [New] 保存验证集 Loader
+        self.val_loader = val_loader
         
         self.use_amp = getattr(config, 'use_amp', True)
         self.dtype = torch.bfloat16 if self.use_amp else torch.float32
 
+        # GradScaler
         self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp)
         
         if config.local_rank == 0:
             print(f"Training with AMP: {self.use_amp}, Dtype: {self.dtype}")
             print(f"EMA initialized with decay: {self.ema.decay}")
             if self.val_loader is not None:
-                print("Validation Loader provided. FID will be calculated on VALIDATION set (Correct Protocol).")
+                print("Validation Loader provided. FID will be calculated on VALIDATION set.")
             else:
-                print("WARNING: No Validation Loader provided. FID will be calculated on TRAINING set (Biased Protocol).")
+                print("WARNING: No Validation Loader provided. FID will be calculated on TRAINING set.")
         
-        # 编译优化
         try:
             self.model = torch.compile(self.model, mode="default")
             if config.local_rank == 0:
@@ -112,11 +111,15 @@ class DiTImangenetTrainer:
         use_model.eval()
         raw_model = use_model.module if hasattr(use_model, 'module') else use_model
         
-        timesteps = torch.linspace(0, self.diffusion.num_timesteps - 1, num_inference_steps, dtype=torch.long)
-        timesteps = timesteps.flip(0).tolist()
+        # --- [关键回归] 恢复旧版本的时间步策略 ---
+        # 旧版逻辑：均匀切分，通常起始点在 980 (避免了 999 处的数值爆炸)
+        # 这样我们就可以去掉 clamp，保留更多高频细节
+        step_ratio = self.diffusion.num_timesteps // num_inference_steps
+        timesteps = (np.arange(0, num_inference_steps) * step_ratio).round()[::-1].copy().astype(int)
         
         # Init noise (std=1)
         x = torch.randn(n, *size).to(self.device)
+        
         C = x.shape[1]
         null_idx = getattr(self.config, 'num_classes', 1000)
         null_labels = torch.full_like(labels, null_idx, device=self.device)
@@ -130,12 +133,17 @@ class DiTImangenetTrainer:
                 t_in = torch.cat([t, t])
                 y_in = torch.cat([labels, null_labels])
             else:
-                x_in, t_in, y_in = x, t, labels
+                x_in = x
+                t_in = t
+                y_in = labels
 
             with torch.amp.autocast('cuda', dtype=self.dtype, enabled=self.use_amp):
                 model_output = raw_model(x_in, t_in, y_in)
             
+            # --- [关键回归] 严格 FP32 计算 ---
             model_output = model_output.float()
+            # 注意：这里不需要 x.float() 因为它已经是 float32
+            
             eps = model_output[:, :C]
             
             if cfg_scale > 1.0:
@@ -144,18 +152,17 @@ class DiTImangenetTrainer:
             
             alpha_bar_t = self.diffusion.alphas_cumprod[t_step].to(self.device).float()
             if i == len(timesteps) - 1:
-                alpha_bar_t_prev = torch.tensor(1.0, device=self.device)
+                alpha_bar_t_prev = torch.tensor(1.0, device=self.device).float()
             else:
                 prev_t = timesteps[i+1]
                 alpha_bar_t_prev = self.diffusion.alphas_cumprod[prev_t].to(self.device).float()
             
             sigma_t = eta * torch.sqrt((1 - alpha_bar_t_prev) / (1 - alpha_bar_t) * (1 - alpha_bar_t / alpha_bar_t_prev))
             
-            # Predict x0
+            # --- [关键回归] 移除截断 (No Clamp) ---
+            # 因为避开了 t=999，这里不会除以 0，数值稳定
+            # 不截断意味着保留了 latent 尾部的极值，这对纹理锐度至关重要
             pred_x0 = (x - torch.sqrt(1 - alpha_bar_t) * eps) / torch.sqrt(alpha_bar_t)
-            
-            # [FIX] 防止数值爆炸，范围放宽到 [-10, 10]
-            pred_x0 = pred_x0.clamp(-10.0, 10.0)
             
             dir_xt = torch.sqrt(1 - alpha_bar_t_prev - sigma_t**2) * eps
             noise = sigma_t * torch.randn_like(x)
@@ -172,9 +179,8 @@ class DiTImangenetTrainer:
         self.model.eval()
         
         try:
-            # --- 1. Sanity Check: Visualize REAL Reconstruction ---
+            # --- 1. Sanity Check (从 val_loader 取) ---
             try:
-                # 优先从 val_loader 取样
                 loader_to_use = self.val_loader if self.val_loader is not None else self.loader
                 real_batch, _ = next(iter(loader_to_use))
                 real_batch = real_batch[:4].to(self.device)
@@ -200,10 +206,11 @@ class DiTImangenetTrainer:
             input_size = getattr(self.config, 'input_size', 32)
             latent_size = (in_channels, input_size, input_size)
 
-            # [Modify] 提高 cfg_scale 到 4.0
+            # 使用 cfg_scale=4.0 提升轮廓清晰度
             z = self.sample_ddim(n_samples, labels, latent_size, num_inference_steps=50, cfg_scale=4.0, model=self.model)
             z = z.float()
             
+            # Correct Unscaling
             x_recon = self.vae.decode(z / 0.18215).sample.float()
             
             x_recon = x_recon.clamp(-1, 1)
@@ -228,11 +235,11 @@ class DiTImangenetTrainer:
         self.model.eval()
         self.fid_metric.reset()
         
+        # OOM Fix
         torch.cuda.empty_cache()
         vae_batch_size = 32
 
-        # [Modify] 关键逻辑：使用验证集进行 FID 评估
-        # 如果 self.val_loader 存在，则使用它；否则回退到 self.loader (并已在 init 打印警告)
+        # 优先使用验证集
         loader_to_use = self.val_loader if self.val_loader is not None else self.loader
         loader_iter = iter(loader_to_use)
 
@@ -241,15 +248,14 @@ class DiTImangenetTrainer:
                 try:
                     real_imgs, _ = next(loader_iter)
                 except StopIteration:
-                    # 如果验证集遍历完了，重新开始
                     loader_iter = iter(loader_to_use)
                     real_imgs, _ = next(loader_iter)
                     
                 real_imgs = real_imgs.to(self.device)
                 
-                # --- Real Images Decoding (Sliced) ---
                 if real_imgs.shape[1] == 4:
                     real_imgs = real_imgs.float()
+                    # 分块解码
                     decoded_list = []
                     for k in range(0, real_imgs.shape[0], vae_batch_size):
                         batch_slice = real_imgs[k : k + vae_batch_size]
@@ -260,9 +266,6 @@ class DiTImangenetTrainer:
                 real_imgs = real_imgs.clamp(-1, 1)
                 real_imgs_uint8 = self._normalize_images(real_imgs)
                 self.fid_metric.update(real_imgs_uint8, real=True)
-                
-                if i == 0 and self.config.local_rank == 0:
-                    print(f"[FID] Real Imgs Mean: {real_imgs.mean().item():.4f}, Std: {real_imgs.std().item():.4f}")
             
             for i in range(num_gen_batches):
                 n_samples = self.config.batch_size
@@ -271,11 +274,10 @@ class DiTImangenetTrainer:
                 input_size = getattr(self.config, 'input_size', 32)
                 latent_size = (in_channels, input_size, input_size)
                 
-                # [Modify] 提高 cfg_scale 到 4.0
+                # 采样使用 cfg=4.0 和 无截断策略
                 z = self.sample_ddim(n_samples, labels, latent_size, num_inference_steps=50, cfg_scale=4.0, model=self.model)
                 z = z.float()
                 
-                # --- Fake Images Decoding (Sliced) ---
                 decoded_list = []
                 for k in range(0, z.shape[0], vae_batch_size):
                     z_slice = z[k : k + vae_batch_size]
@@ -287,9 +289,6 @@ class DiTImangenetTrainer:
                 
                 fake_imgs_uint8 = self._normalize_images(fake_imgs)
                 self.fid_metric.update(fake_imgs_uint8, real=False)
-                
-                if i == 0 and self.config.local_rank == 0:
-                    print(f"[FID] Fake Imgs Mean: {fake_imgs.mean().item():.4f}, Std: {fake_imgs.std().item():.4f}")
             
             fid_score = self.fid_metric.compute()
             if self.config.local_rank == 0:
@@ -319,13 +318,11 @@ class DiTImangenetTrainer:
             images = images.to(self.device)
             labels = labels.to(self.device)
             
-            # --- Latent Scaling Logic ---
             if images.shape[1] == 3:
                 with torch.no_grad():
                     posterior = self.vae.encode(images).latent_dist
                     latents = posterior.sample() * 0.18215
             else:
-                # Disk latents (Unscaled std~5.5) -> Scaled (std~1.0)
                 latents = images * 0.18215
             
             t = torch.randint(0, self.diffusion.num_timesteps, (images.shape[0],), device=self.device)
@@ -334,8 +331,6 @@ class DiTImangenetTrainer:
             loss = loss_dict["loss"].mean()
             
             self.optimizer.zero_grad()
-            
-            # Scaler Logic
             self.scaler.scale(loss).backward()
             self.scaler.unscale_(self.optimizer)
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
