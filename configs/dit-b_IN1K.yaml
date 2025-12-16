@@ -32,7 +32,7 @@ training:
   batch_size: 256     
   
   lr: 0.0001          # 1e-4
-  results_dir: "./results/dit_b_2_latent-v7-re"
+  results_dir: "./results/dit_b_2_latent-v7-re2"
   use_amp: True       # 混合精度
   seed: 42
   log_interval: 1
