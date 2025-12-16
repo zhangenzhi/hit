@@ -13,14 +13,27 @@ module load gcc ompi
 export MASTER_ADDR=$(head -n 1 $PBS_NODEFILE)
 export MASTER_PORT=29500
 
-# 3. [关键配置] NCCL / 网络设置
-# 强制 GLOO (握手) 和 NCCL (数据) 使用 InfiniBand 网络接口 ib0
-export GLOO_SOCKET_IFNAME=ib0
-export NCCL_SOCKET_IFNAME=ib0
-# 开启 NCCL INFO 日志，运行后查看输出日志中是否有 "NET/IB" 字样，确认是否使用了 InfiniBand
-export NCCL_DEBUG=INFO
-# 显式指定使用 H100 的 RDMA 网卡 (通常是 mlx5_x)
+# === 调试步骤：打印当前节点的网络接口信息 ===
+# 如果再次报错，请把输出日志中 "ip addr" 的结果发给我
+echo "=== Network Interfaces info ==="
+ip addr | grep inet
+echo "=============================="
+
+# 3. [核心修正] 网络分离配置
+
+# A. 握手与控制 (Socket)：不要用 ib0，改用以太网
+# "^lo,docker0" 意思是：使用除了本地回环和docker以外的第一个可用网卡
+export GLOO_SOCKET_IFNAME=^lo,docker0
+export NCCL_SOCKET_IFNAME=^lo,docker0
+
+# B. 数据传输 (RDMA)：强制使用 InfiniBand 高速通道
+# H100 通常使用 mlx5 系列网卡
 export NCCL_IB_HCA=mlx5
+export NCCL_IB_DISABLE=0    # 确保开启 IB
+export NCCL_P2P_DISABLE=0   # 确保开启 P2P
+
+# 开启 INFO 日志，验证是否成功检测到 IB (NET/IB)
+export NCCL_DEBUG=INFO
 
 echo "Master Node: $MASTER_ADDR"
 
@@ -41,9 +54,7 @@ unset __conda_setup
 cd /work/c30636/hit
 conda activate hde
 
-# 4. [核心修改] 添加 --bind-to none
-# 如果不加这一行，mpirun 可能会把 torchrun 限制在单个 CPU 核上，
-# 导致该节点下的 4 个 GPU 进程抢占 CPU，速度极慢。
+# 4. 启动命令 (保持 --bind-to none 以避免 CPU 单核瓶颈)
 mpirun -np 2 \
     --map-by ppr:1:node \
     --bind-to none \
@@ -52,6 +63,8 @@ mpirun -np 2 \
     -x GLOO_SOCKET_IFNAME \
     -x NCCL_SOCKET_IFNAME \
     -x NCCL_IB_HCA \
+    -x NCCL_IB_DISABLE \
+    -x NCCL_P2P_DISABLE \
     -x NCCL_DEBUG \
     -x PATH \
     torchrun \
