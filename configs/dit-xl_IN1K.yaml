@@ -16,7 +16,7 @@ model:
   hidden_size: 1152
   depth: 28
   num_heads: 16
-  learn_sigma: False
+  learn_sigma: True
   num_classes: 1000
 
 diffusion:
