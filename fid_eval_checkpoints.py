@@ -56,6 +56,7 @@ def main():
     parser.add_argument("--checkpoint_dir", type=str, required=True, help="Directory containing checkpoint_*.pt files")
     parser.add_argument("--data_path", type=str, default=None, help="Override data path (if needed)")
     parser.add_argument("--num_fid_batches", type=int, default=15, help="Number of batches for FID evaluation (default 15 * 256 ~= 3840 images)")
+    parser.add_argument("--interval", type=int, default=1, help="Interval for evaluating checkpoints (e.g. 10 means evaluate every 10th checkpoint)")
     parser.add_argument("--local-rank", type=int, default=int(os.environ.get("LOCAL_RANK", 0)), help="Local rank for DDP")
     
     args = parser.parse_args()
@@ -99,9 +100,17 @@ def main():
     # 按 epoch 从小到大排序
     ckpt_files.sort(key=lambda x: extract_epoch_from_filename(os.path.basename(x)))
     
+    # [Modify] 过滤 Checkpoints：只保留符合间隔的
+    if args.interval > 1:
+        ckpt_files = [f for f in ckpt_files if extract_epoch_from_filename(os.path.basename(f)) % args.interval == 0]
+        # 也可以强制保留最后一个 checkpoint，防止刚好错过
+        # if len(ckpt_files) == 0 or extract_epoch_from_filename(os.path.basename(ckpt_files[-1])) != extract_epoch_from_filename(os.path.basename(glob.glob(os.path.join(args.checkpoint_dir, "checkpoint_*.pt"))[-1])):
+        #     # Optional logic to include the very last one
+        #     pass
+
     if len(ckpt_files) == 0:
         if flat_config.local_rank == 0:
-            print("No checkpoints found!")
+            print(f"No checkpoints found matching interval {args.interval}!")
         return
 
     # 4. 构建 DataLoaders (重点：获取 val_loader)
@@ -193,4 +202,4 @@ def main():
 if __name__ == "__main__":
     main()
     
-# torchrun --nproc_per_node=8 eval_checkpoints.py --checkpoint_dir ./results/dit_b_2_latent-v7
+# torchrun --nproc_per_node=4 fid_eval_checkpoints.py --checkpoint_dir ./results/dit_b_2_latent-v7 --interval 10
