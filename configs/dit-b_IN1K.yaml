@@ -16,7 +16,7 @@ model:
   hidden_size: 768    # DiT-B hidden size
   depth: 12           # DiT-B layers
   num_heads: 12       # DiT-B heads
-  learn_sigma: False
+  learn_sigma: True
   num_classes: 1000
 
 diffusion:
