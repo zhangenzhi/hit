@@ -1,10 +1,12 @@
 # DiT-XL/2 ImageNet 256x256 Configuration
 
 data:
-  # 请修改为实际的 ImageNet 路径
-  data_path: "/work/c30778/dataset/imagenet/"
+  # 【关键修改 1】指向预处理好的 Latent 目录
+  # 之前是: /work/c30778/dataset/imagenet/
+  data_path: "/work/c30778/imagenet_rc10_lat/"
+  # data_path: "/work/c30778/imagenet_rc10_lat2/"
   image_size: 256
-  num_workers: 16
+  num_workers: 32  # Latent 读取很快，可以适当增加 worker
 
 model:
   # DiT-XL/2 Config
@@ -14,20 +16,22 @@ model:
   hidden_size: 1152
   depth: 28
   num_heads: 16
-  learn_sigma: True
+  learn_sigma: False
   num_classes: 1000
 
 diffusion:
   num_timesteps: 1000
   beta_start: 0.0001
   beta_end: 0.02
+  schedule: "cosine" 
 
 training:
-  epochs: 100
-  batch_size: 64      # Per GPU batch size
+  epochs: 400
+  batch_size: 128     
+  
   lr: 0.0001          # 1e-4
-  results_dir: "./results/dit_xl_2"
-  use_amp: True       # 使用 BF16/FP16 混合精度
+  results_dir: "./results/dit_xl_2_latent-v1"
+  use_amp: True       # 混合精度
   seed: 42
-  log_interval: 100
-  save_interval: 1    # Epochs
+  log_interval: 1
+  save_interval: 1
