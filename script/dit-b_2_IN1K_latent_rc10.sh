@@ -13,29 +13,30 @@ module load gcc ompi
 export MASTER_ADDR=$(head -n 1 $PBS_NODEFILE)
 export MASTER_PORT=29500
 
-# === 调试步骤：打印当前节点的网络接口信息 ===
-# 如果再次报错，请把输出日志中 "ip addr" 的结果发给我
-echo "=== Network Interfaces info ==="
-ip addr | grep inet
-echo "=============================="
+# 3. [核心修复] 自动探测正确的以太网卡名称
+# 逻辑：列出所有 IPv4 地址 -> 排除 lo, docker, 169.254 (link-local) -> 取第一个剩下的网卡名
+# 这一步是为了避开导致报错的 169.254.3.1
+export DETECTED_IFNAME=$(ip -o -4 addr show | awk '!/^[0-9]+: lo|docker|169\.254/ {print $2}' | head -n 1)
 
-# 3. [核心修正] 网络分离配置
+# 如果探测失败，回退到排除法（尝试排除 usb0，因为 169.254 常出现在 usb0）
+if [ -z "$DETECTED_IFNAME" ]; then
+    echo "Warning: Auto-detection failed, using fallback exclusion."
+    export GLOO_SOCKET_IFNAME=^lo,docker0,usb0,virbr0
+    export NCCL_SOCKET_IFNAME=^lo,docker0,usb0,virbr0
+else
+    echo "Auto-detected valid interface: $DETECTED_IFNAME"
+    export GLOO_SOCKET_IFNAME=$DETECTED_IFNAME
+    export NCCL_SOCKET_IFNAME=$DETECTED_IFNAME
+fi
 
-# A. 握手与控制 (Socket)：不要用 ib0，改用以太网
-# "^lo,docker0" 意思是：使用除了本地回环和docker以外的第一个可用网卡
-export GLOO_SOCKET_IFNAME=^lo,docker0
-export NCCL_SOCKET_IFNAME=^lo,docker0
-
-# B. 数据传输 (RDMA)：强制使用 InfiniBand 高速通道
-# H100 通常使用 mlx5 系列网卡
+# 4. 数据传输配置 (保持不变，强制使用 IB)
 export NCCL_IB_HCA=mlx5
-export NCCL_IB_DISABLE=0    # 确保开启 IB
-export NCCL_P2P_DISABLE=0   # 确保开启 P2P
-
-# 开启 INFO 日志，验证是否成功检测到 IB (NET/IB)
+export NCCL_IB_DISABLE=0
+export NCCL_P2P_DISABLE=0
 export NCCL_DEBUG=INFO
 
 echo "Master Node: $MASTER_ADDR"
+echo "Socket Interface: $GLOO_SOCKET_IFNAME"
 
 # >>> conda initialize >>>
 __conda_setup="$('/home/c30746/miniconda3/bin/conda' 'shell.bash' 'hook' 2> /dev/null)"
@@ -54,7 +55,8 @@ unset __conda_setup
 cd /work/c30636/hit
 conda activate hde
 
-# 4. 启动命令 (保持 --bind-to none 以避免 CPU 单核瓶颈)
+# 5. 启动命令
+# 务必通过 -x 传递 DETECTED_IFNAME 相关的变量
 mpirun -np 2 \
     --map-by ppr:1:node \
     --bind-to none \
