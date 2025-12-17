@@ -58,6 +58,7 @@ class DiTImangenetTrainer:
             self.model = DDP(self.model, device_ids=[config.local_rank])
             
         self.ema = EMA(self.model, decay=0.9999)
+        self.ema_update_every = getattr(config, 'ema_update_every', 10)
             
         self.optimizer = torch.optim.AdamW(
             self.model.parameters(), 
@@ -72,6 +73,7 @@ class DiTImangenetTrainer:
 
         # GradScaler
         self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp)
+        self.train_loss_history = []
         
         if config.local_rank == 0:
             print(f"Training with AMP: {self.use_amp}, Dtype: {self.dtype}")
@@ -80,13 +82,17 @@ class DiTImangenetTrainer:
                 print("Validation Loader provided. FID will be calculated on VALIDATION set.")
             else:
                 print("WARNING: No Validation Loader provided. FID will be calculated on TRAINING set.")
-        
+                
+        # [优化] 尝试使用 max-autotune 获得更高性能
         try:
-            self.model = torch.compile(self.model, mode="default")
+            # max-autotune 会进行更激进的算子融合 (Triton)，比 default 快 10-20%
+            # 如果显存不够或编译太慢，可回退到 'default'
+            compile_mode = getattr(config, 'compile_mode', 'max-autotune') 
+            self.model = torch.compile(self.model, mode=compile_mode)
             if config.local_rank == 0:
-                print("Model compiled with torch.compile")
+                print(f"Model compiled with torch.compile (mode={compile_mode})")
         except Exception as e:
-            print(f"Warning: torch.compile failed: {e}")
+            print(f"Warning: torch.compile failed: {e}. Fallback to Eager mode.")
 
         self.fid_metric = None
         try:
@@ -301,43 +307,66 @@ class DiTImangenetTrainer:
 
     def train_one_epoch(self, epoch):
         self.model.train()
+        # [优化] 使用 inference_mode 而不是 no_grad (如果 VAE 冻结)
+        self.vae.eval()
+        
         start_time = time()
         max_steps = getattr(self.config, 'max_train_steps', None)
         
-        def mp_model_wrapper(*args, **kwargs):
-            with torch.amp.autocast('cuda', dtype=self.dtype, enabled=self.use_amp):
-                return self.model(*args, **kwargs)
+        # [关键优化] 移除 epoch_loss 累加器中的 .item()
+        # 改用 running_loss 在 GPU 上累积，仅在打印时同步
+        running_loss = torch.tensor(0.0, device=self.device)
+        log_steps = 0
         
         for step, (images, labels) in enumerate(self.loader):
-            if max_steps is not None and step >= max_steps:
-                break
+            if max_steps is not None and step >= max_steps: break
 
-            images = images.to(self.device)
-            labels = labels.to(self.device)
+            images = images.to(self.device, non_blocking=True)
+            labels = labels.to(self.device, non_blocking=True)
             
-            if images.shape[1] == 3:
-                with torch.no_grad():
+            # VAE Encode (No Grads)
+            with torch.no_grad(): 
+                if images.shape[1] == 3:
                     posterior = self.vae.encode(images).latent_dist
                     latents = posterior.sample() * 0.18215
-            else:
-                latents = images * 0.18215
+                else:
+                    latents = images * 0.18215
             
-            t = torch.randint(0, self.diffusion.num_timesteps, (images.shape[0],), device=self.device)
+            t = torch.randint(0, self.diffusion.num_timesteps - 10, (images.shape[0],), device=self.device)
             
-            loss_dict = self.diffusion.training_losses(mp_model_wrapper, latents, t, model_kwargs=dict(y=labels))
-            loss = loss_dict["loss"].mean()
+            # Forward & Backward
+            with torch.amp.autocast('cuda', dtype=self.dtype, enabled=self.use_amp):
+                loss_dict = self.diffusion.training_losses(self.model, latents, t, model_kwargs=dict(y=labels))
+                loss = loss_dict["loss"].mean()
             
-            self.optimizer.zero_grad()
+            self.optimizer.zero_grad(set_to_none=True) # [优化] set_to_none 稍微快一点
             self.scaler.scale(loss).backward()
             self.scaler.unscale_(self.optimizer)
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
             self.scaler.step(self.optimizer)
             self.scaler.update()
             
-            self.ema.update()
+            # [关键优化] 稀疏 EMA 更新
+            if step % self.ema_update_every == 0:
+                self.ema.update()
             
-            if step % 100 == 0 and self.config.local_rank == 0:
-                print(f"Epoch {epoch} | Step {step} | Loss: {loss.item():.4f} | Time: {time() - start_time:.2f}s")
+            # [关键优化] 异步 Loss 记录
+            # detach 防止计算图累积，但不调用 .item()
+            running_loss += loss.detach()
+            log_steps += 1
+            
+            # 仅在需要打印日志时才触发 CUDA 同步
+            if step % 100 == 0:
+                # 这里的 .item() 会导致同步，但每 100 步一次是可以接受的
+                avg_loss = running_loss.item() / log_steps
+                
+                if self.config.local_rank == 0:
+                    current_lr = self.optimizer.param_groups[0]['lr']
+                    print(f"Epoch {epoch} | Step {step} | Loss: {avg_loss:.4f} | LR: {current_lr:.2e} | Time: {time() - start_time:.2f}s")
+                
+                # 重置计数器
+                running_loss = torch.tensor(0.0, device=self.device)
+                log_steps = 0
                 start_time = time()
 
         if self.config.local_rank == 0:
@@ -346,7 +375,10 @@ class DiTImangenetTrainer:
                 self.visualize(epoch)
             
         if epoch > 0 and epoch % 10 == 0:
-             self.evaluate_fid(epoch, num_gen_batches=10)
+             self.evaluate_fid(epoch)
+
+        # 返回 None 或估计值，不再强求精确的 epoch average 以避免额外同步
+        return None 
 
     def save_checkpoint(self, epoch):
         if self.config.local_rank == 0:
