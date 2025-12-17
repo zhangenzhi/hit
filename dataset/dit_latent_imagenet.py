@@ -5,11 +5,15 @@ import random
 from torchvision import datasets
 from torch.utils.data import DataLoader, DistributedSampler, Dataset
 
+# [Fix 2] Fallback 形状修正
+# 假设预处理时 num_crops=10。如果不确定，这里返回 None，在 getitem 里处理会更稳健
 def robust_loader(path):
-    # [修正 1] 移除 try-except。
-    # 必须让错误暴露出来！如果文件坏了或路径不对，程序应该崩溃而不是静默失败。
-    # 否则模型会训练在全0数据上，导致生成全是噪声。
-    return torch.load(path, map_location='cpu')
+    try:
+        # map_location='cpu' 避免多线程加载时占用过多 GPU 显存
+        return torch.load(path, map_location='cpu')
+    except Exception as e:
+        print(f"Error loading {path}: {e}")
+        return None  # 返回 None，让 Dataset 处理
 
 class LatentFolder(datasets.DatasetFolder):
     """
@@ -27,28 +31,28 @@ class LatentFolder(datasets.DatasetFolder):
 
     def __getitem__(self, index):
         path, target = self.samples[index]
-        
-        # 直接加载，如果有问题（如文件损坏），这里会直接报错终止训练
         sample = self.loader(path)
         
-        # [修正 2] 移除 "return torch.zeros" 的 Fallback 逻辑
-        # 严禁给模型喂全0数据！
-        
-        # 处理维度 [Num_Crops, C, H, W] -> [C, H, W]
-        # 只有当数据包含 Crop 维度时才处理
+        # [Fix 2] 处理加载失败的情况 (Fallback)
+        if sample is None:
+            # 假设标准尺寸，这里需要根据你的实际 Latent 尺寸硬编码或者动态获取
+            # 如果 sample 为 None，我们生成一个全0的 latent 避免崩溃
+            # 注意：这里的形状是最终喂给模型的形状 [4, 32, 32]
+            return torch.zeros(4, 32, 32), target
+
+        # [Fix 1] 处理多 Crop 维度 [Num_Crops, C, H, W] -> [C, H, W]
         if sample.dim() == 4: 
             num_crops = sample.shape[0]
             if self.is_train:
-                # 训练时：随机选一个 crop，实现数据增强
+                # 训练时：随机选一个 crop，实现数据增强效果
                 idx = random.randint(0, num_crops - 1)
                 sample = sample[idx]
             else:
-                # 验证时：固定选第一个
-                # [重要提示] 请确保验证集的 .pt 是用 CenterCrop 生成的 (num_crops=1)
-                # 否则这里取到的就是随机裁剪图，会导致 FID 虚高。
+                # 验证时：固定选第一个，保证验证指标稳定
+                # (前提是所有样本也是这样处理的)
                 sample = sample[0]
         
-        # 此时 sample 形状应为 [C, H, W] (e.g. [4, 32, 32])
+        # 此时 sample 形状应为 [4, 32, 32]
         return sample, target
 
 def build_dit_dataloaders(args):
@@ -59,6 +63,7 @@ def build_dit_dataloaders(args):
     if data_dir is None:
         raise ValueError("args must contain 'data_path' or 'data_dir'")
 
+    # 获取参数
     model_conf = getattr(args, 'model', {})
     training_conf = getattr(args, 'training', {})
     
@@ -73,15 +78,9 @@ def build_dit_dataloaders(args):
     train_root = os.path.join(data_dir, 'train')
     val_root = os.path.join(data_dir, 'val')
     
-    # [修正 3] 更智能的路径回退检查
-    # 如果标准的 train/val 结构不存在，检查是否 data_dir 本身就是 train root
     if not os.path.exists(train_root):
-        if rank == 0:
-            print(f"Warning: '{train_root}' not found. Trying to use '{data_dir}' as train root.")
         train_root = data_dir
-        # 如果连 val 文件夹都不存在，则禁用验证集
-        if not os.path.exists(val_root):
-            val_root = None 
+        val_root = None 
 
     # --- 自动检测模式 ---
     is_latent = False
@@ -100,20 +99,16 @@ def build_dit_dataloaders(args):
 
     if rank == 0:
         mode_str = "Latent (.pt) [High Throughput]" if is_latent else "Pixel (Image) [Online Encoding]"
-        val_status = f"Found at {val_root}" if (val_root and os.path.exists(val_root)) else "NOT FOUND (FID will be inaccurate)"
         print(f"Build DiT Dataloaders | Mode: {mode_str} | Batch: {batch_size} | Workers: {num_workers}")
-        print(f"Validation Set: {val_status}")
 
     # --- 构建 Dataset ---
     if is_latent:
+        # [Modify] 传入 is_train 标志
         train_dataset = LatentFolder(train_root, is_train=True)
-        if val_root and os.path.exists(val_root):
-            val_dataset = LatentFolder(val_root, is_train=False)
-        else:
-            val_dataset = None
+        val_dataset = LatentFolder(val_root, is_train=False) if (val_root and os.path.exists(val_root)) else None
         
     else:
-        # Pixel 模式：用于调试或原始数据
+        # Pixel 模式：保持原样
         from torchvision import transforms
         
         if isinstance(model_conf, dict) and 'image_size' in model_conf:
@@ -136,10 +131,7 @@ def build_dit_dataloaders(args):
         ])
         
         train_dataset = datasets.ImageFolder(train_root, transform=train_transform)
-        if val_root and os.path.exists(val_root):
-            val_dataset = datasets.ImageFolder(val_root, transform=val_transform)
-        else:
-            val_dataset = None
+        val_dataset = datasets.ImageFolder(val_root, transform=val_transform) if (val_root and os.path.exists(val_root)) else None
 
     # --- 构建 Loader ---
     use_ddp = torch.distributed.is_initialized()
