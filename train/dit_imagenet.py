@@ -73,6 +73,9 @@ class DiTImangenetTrainer:
         # GradScaler
         self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp)
         
+        # [Added] 用于记录训练过程中的 loss
+        self.train_loss_history = []
+
         if config.local_rank == 0:
             print(f"Training with AMP: {self.use_amp}, Dtype: {self.dtype}")
             print(f"EMA initialized with decay: {self.ema.decay}")
@@ -111,13 +114,10 @@ class DiTImangenetTrainer:
         use_model.eval()
         raw_model = use_model.module if hasattr(use_model, 'module') else use_model
         
-        # --- [关键回归] 恢复旧版本的时间步策略 ---
-        # 旧版逻辑：均匀切分，通常起始点在 980 (避免了 999 处的数值爆炸)
-        # 这样我们就可以去掉 clamp，保留更多高频细节
+        # --- [关键回归] 恢复旧版本的时间步策略 (从 980 开始，避开 999) ---
         step_ratio = self.diffusion.num_timesteps // num_inference_steps
         timesteps = (np.arange(0, num_inference_steps) * step_ratio).round()[::-1].copy().astype(int)
         
-        # Init noise (std=1)
         x = torch.randn(n, *size).to(self.device)
         
         C = x.shape[1]
@@ -142,7 +142,6 @@ class DiTImangenetTrainer:
             
             # --- [关键回归] 严格 FP32 计算 ---
             model_output = model_output.float()
-            # 注意：这里不需要 x.float() 因为它已经是 float32
             
             eps = model_output[:, :C]
             
@@ -159,6 +158,8 @@ class DiTImangenetTrainer:
             
             sigma_t = eta * torch.sqrt((1 - alpha_bar_t_prev) / (1 - alpha_bar_t) * (1 - alpha_bar_t / alpha_bar_t_prev))
             
+            # --- [关键回归] 移除截断 (No Clamp) ---
+            # 因为采样避开了 t=999，这里数值稳定，无需截断，保留高频细节
             pred_x0 = (x - torch.sqrt(1 - alpha_bar_t) * eps) / torch.sqrt(alpha_bar_t)
             
             dir_xt = torch.sqrt(1 - alpha_bar_t_prev - sigma_t**2) * eps
@@ -203,11 +204,10 @@ class DiTImangenetTrainer:
             input_size = getattr(self.config, 'input_size', 32)
             latent_size = (in_channels, input_size, input_size)
 
-            # 使用 cfg_scale=4.0 提升轮廓清晰度
+            # 使用 cfg_scale=4.0
             z = self.sample_ddim(n_samples, labels, latent_size, num_inference_steps=50, cfg_scale=4.0, model=self.model)
             z = z.float()
             
-            # Correct Unscaling
             x_recon = self.vae.decode(z / 0.18215).sample.float()
             
             x_recon = x_recon.clamp(-1, 1)
@@ -232,7 +232,6 @@ class DiTImangenetTrainer:
         self.model.eval()
         self.fid_metric.reset()
         
-        # OOM Fix
         torch.cuda.empty_cache()
         vae_batch_size = 32
 
@@ -250,9 +249,9 @@ class DiTImangenetTrainer:
                     
                 real_imgs = real_imgs.to(self.device)
                 
+                # --- Real Images Decoding (Sliced) ---
                 if real_imgs.shape[1] == 4:
                     real_imgs = real_imgs.float()
-                    # 分块解码
                     decoded_list = []
                     for k in range(0, real_imgs.shape[0], vae_batch_size):
                         batch_slice = real_imgs[k : k + vae_batch_size]
@@ -304,9 +303,9 @@ class DiTImangenetTrainer:
         start_time = time()
         max_steps = getattr(self.config, 'max_train_steps', None)
         
-        def mp_model_wrapper(*args, **kwargs):
-            with torch.amp.autocast('cuda', dtype=self.dtype, enabled=self.use_amp):
-                return self.model(*args, **kwargs)
+        # [Added] 用于累计 epoch 平均 loss
+        epoch_loss = 0.0
+        steps_count = 0
         
         for step, (images, labels) in enumerate(self.loader):
             if max_steps is not None and step >= max_steps:
@@ -322,9 +321,12 @@ class DiTImangenetTrainer:
             else:
                 latents = images * 0.18215
             
-            t = torch.randint(0, self.diffusion.num_timesteps, (images.shape[0],), device=self.device)
+            # --- [关键修改] 防止 Loss 震荡：不采样最后的 10 个时间步 ---
+            # 避开 t >= 990 (假设 num_timesteps=1000)
+            # 这些步全是噪声，容易导致梯度不稳
+            t = torch.randint(0, self.diffusion.num_timesteps - 10, (images.shape[0],), device=self.device)
             
-            loss_dict = self.diffusion.training_losses(mp_model_wrapper, latents, t, model_kwargs=dict(y=labels))
+            loss_dict = self.diffusion.training_losses(self.model, latents, t, model_kwargs=dict(y=labels))
             loss = loss_dict["loss"].mean()
             
             self.optimizer.zero_grad()
@@ -335,6 +337,10 @@ class DiTImangenetTrainer:
             self.scaler.update()
             
             self.ema.update()
+            
+            # [Added] 记录 step loss
+            epoch_loss += loss.item()
+            steps_count += 1
             
             if step % 100 == 0 and self.config.local_rank == 0:
                 print(f"Epoch {epoch} | Step {step} | Loss: {loss.item():.4f} | Time: {time() - start_time:.2f}s")
@@ -347,10 +353,19 @@ class DiTImangenetTrainer:
             
         if epoch > 0 and epoch % 10 == 0:
              self.evaluate_fid(epoch, num_gen_batches=10)
+             
+        # [Added] 返回平均 loss
+        avg_loss = epoch_loss / steps_count if steps_count > 0 else 0.0
+        return avg_loss
 
-    def save_checkpoint(self, epoch):
+    def save_checkpoint(self, epoch, avg_loss=None):
+        # [Modified] 接收 avg_loss 参数
         if self.config.local_rank == 0:
             checkpoint_path = os.path.join(self.config.results_dir, f"checkpoint_{epoch}.pt")
+            
+            # 更新 loss 历史
+            if avg_loss is not None:
+                self.train_loss_history.append((epoch, avg_loss))
             
             checkpoint = {
                 "model": self.model.module.state_dict() if self.config.use_ddp else self.model.state_dict(),
@@ -358,15 +373,18 @@ class DiTImangenetTrainer:
                 "optimizer": self.optimizer.state_dict(),
                 "epoch": epoch,
                 "config": self.config,
+                # [Added] 保存 loss 信息
+                "train_loss": avg_loss,
+                "loss_history": self.train_loss_history,
             }
             torch.save(checkpoint, checkpoint_path)
-            print(f"Saved checkpoint to {checkpoint_path}")
+            print(f"Saved checkpoint to {checkpoint_path} (Loss: {avg_loss:.4f})")
             latest_path = os.path.join(self.config.results_dir, "latest.pt")
             torch.save(checkpoint, latest_path)
 
     def resume_checkpoint(self, checkpoint_path):
         print(f"Loading checkpoint from {checkpoint_path}...")
-        checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
+        checkpoint = torch.load(checkpoint_path, map_location=self.device)
         
         model_state_dict = checkpoint["model"]
         if self.config.use_ddp:
@@ -383,6 +401,11 @@ class DiTImangenetTrainer:
 
         if "optimizer" in checkpoint and self.optimizer is not None:
             self.optimizer.load_state_dict(checkpoint["optimizer"])
+            
+        # [Added] 恢复 loss 历史
+        if "loss_history" in checkpoint:
+            self.train_loss_history = checkpoint["loss_history"]
+            print(f"Restored loss history: {len(self.train_loss_history)} epochs")
             
         start_epoch = checkpoint.get("epoch", -1) + 1
         print(f"Resuming training from epoch {start_epoch}")
