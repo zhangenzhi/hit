@@ -7,7 +7,7 @@ from time import time
 from copy import deepcopy
 
 # [修改] 导入所有辅助类和函数，包括 save/resume checkpoint
-from utilz import EMA, visualize, evaluate_fid, save_checkpoint, resume_checkpoint
+from train.utilz import EMA, visualize, evaluate_fid
 
 class DiTImangenetTrainer:
     def __init__(self, model, diffusion, vae, loader, val_loader, config):
