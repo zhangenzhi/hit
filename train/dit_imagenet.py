@@ -6,8 +6,8 @@ import numpy as np
 from time import time
 from copy import deepcopy
 
-# [修改] 导入所有辅助类和函数
-from utilz import EMA, visualize, evaluate_fid
+# [修改] 导入所有辅助类和函数，包括 save/resume checkpoint
+from utilz import EMA, visualize, evaluate_fid, save_checkpoint, resume_checkpoint
 
 class DiTImangenetTrainer:
     def __init__(self, model, diffusion, vae, loader, val_loader, config):
@@ -219,48 +219,4 @@ class DiTImangenetTrainer:
              evaluate_fid(self, epoch)
 
         # 返回 None 或估计值，不再强求精确的 epoch average 以避免额外同步
-        return None 
-
-    def save_checkpoint(self, epoch, avg_loss=None):
-        if self.config.local_rank == 0:
-            checkpoint_path = os.path.join(self.config.results_dir, f"checkpoint_{epoch}.pt")
-            checkpoint = {
-                "model": self.model.module.state_dict() if self.config.use_ddp else self.model.state_dict(),
-                "ema": self.ema.shadow, 
-                "optimizer": self.optimizer.state_dict(),
-                "epoch": epoch,
-                "config": self.config,
-            }
-            torch.save(checkpoint, checkpoint_path)
-            print(f"Saved checkpoint to {checkpoint_path}")
-            latest_path = os.path.join(self.config.results_dir, "latest.pt")
-            torch.save(checkpoint, latest_path)
-
-    def resume_checkpoint(self, checkpoint_path):
-        print(f"Loading checkpoint from {checkpoint_path}...")
-        checkpoint = torch.load(checkpoint_path, map_location=self.device)
-        
-        model_state_dict = checkpoint["model"]
-        # 处理可能的 DDP 前缀不匹配
-        if self.config.use_ddp:
-             self.model.module.load_state_dict(model_state_dict)
-        else:
-             # 如果 checkpoint 是 DDP 存的但当前是单卡，去掉 'module.' 前缀
-             new_state_dict = {}
-             for k, v in model_state_dict.items():
-                 if k.startswith('module.'):
-                     new_state_dict[k[7:]] = v
-                 else:
-                     new_state_dict[k] = v
-             self.model.load_state_dict(new_state_dict)
-            
-        if "ema" in checkpoint:
-            self.ema.shadow = checkpoint["ema"]
-        else:
-            self.ema.register()
-
-        if "optimizer" in checkpoint and self.optimizer is not None:
-            self.optimizer.load_state_dict(checkpoint["optimizer"])
-            
-        start_epoch = checkpoint.get("epoch", -1) + 1
-        return start_epoch
+        return None

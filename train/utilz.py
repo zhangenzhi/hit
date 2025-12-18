@@ -170,3 +170,53 @@ def evaluate_fid(trainer, epoch, num_gen_batches=10):
         torch.cuda.empty_cache()
     if trainer.config.use_ddp:
         dist.barrier()
+
+def save_checkpoint(trainer, epoch, avg_loss=None):
+    """
+    保存 Checkpoint
+    """
+    if trainer.config.local_rank == 0:
+        checkpoint_path = os.path.join(trainer.config.results_dir, f"checkpoint_{epoch}.pt")
+        checkpoint = {
+            "model": trainer.model.module.state_dict() if trainer.config.use_ddp else trainer.model.state_dict(),
+            "ema": trainer.ema.shadow, 
+            "optimizer": trainer.optimizer.state_dict(),
+            "epoch": epoch,
+            "config": trainer.config,
+        }
+        torch.save(checkpoint, checkpoint_path)
+        print(f"Saved checkpoint to {checkpoint_path}")
+        latest_path = os.path.join(trainer.config.results_dir, "latest.pt")
+        torch.save(checkpoint, latest_path)
+
+def resume_checkpoint(trainer, checkpoint_path):
+    """
+    恢复 Checkpoint
+    """
+    print(f"Loading checkpoint from {checkpoint_path}...")
+    checkpoint = torch.load(checkpoint_path, map_location=trainer.device)
+    
+    model_state_dict = checkpoint["model"]
+    # 处理可能的 DDP 前缀不匹配
+    if trainer.config.use_ddp:
+            trainer.model.module.load_state_dict(model_state_dict)
+    else:
+            # 如果 checkpoint 是 DDP 存的但当前是单卡，去掉 'module.' 前缀
+            new_state_dict = {}
+            for k, v in model_state_dict.items():
+                if k.startswith('module.'):
+                    new_state_dict[k[7:]] = v
+                else:
+                    new_state_dict[k] = v
+            trainer.model.load_state_dict(new_state_dict)
+        
+    if "ema" in checkpoint:
+        trainer.ema.shadow = checkpoint["ema"]
+    else:
+        trainer.ema.register()
+
+    if "optimizer" in checkpoint and trainer.optimizer is not None:
+        trainer.optimizer.load_state_dict(checkpoint["optimizer"])
+        
+    start_epoch = checkpoint.get("epoch", -1) + 1
+    return start_epoch
