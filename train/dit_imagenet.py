@@ -4,48 +4,10 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 import os
 import numpy as np
 from time import time
-from torchvision.utils import save_image
 from copy import deepcopy
 
-# --- 1. EMA 类 (逻辑不变，仅优化调用频率) ---
-class EMA:
-    def __init__(self, model, decay=0.9999):
-        self.model = model
-        self.decay = decay
-        self.shadow = {}
-        self.backup = {}
-        self.register()
-
-    def register(self):
-        # 处理 DDP 包裹的情况
-        model_to_track = self.model.module if hasattr(self.model, 'module') else self.model
-        for name, param in model_to_track.named_parameters():
-            if param.requires_grad:
-                self.shadow[name] = param.data.clone().detach()
-
-    def update(self):
-        model_to_track = self.model.module if hasattr(self.model, 'module') else self.model
-        for name, param in model_to_track.named_parameters():
-            if param.requires_grad:
-                assert name in self.shadow
-                # 这是一个内存带宽密集型操作
-                new_average = (1.0 - self.decay) * param.data + self.decay * self.shadow[name]
-                self.shadow[name] = new_average.clone()
-
-    def apply_shadow(self):
-        model_to_track = self.model.module if hasattr(self.model, 'module') else self.model
-        for name, param in model_to_track.named_parameters():
-            if param.requires_grad:
-                self.backup[name] = param.data
-                param.data = self.shadow[name]
-
-    def restore(self):
-        model_to_track = self.model.module if hasattr(self.model, 'module') else self.model
-        for name, param in model_to_track.named_parameters():
-            if param.requires_grad:
-                assert name in self.backup
-                param.data = self.backup[name]
-        self.backup = {}
+# [修改] 导入所有辅助类和函数
+from utilz import EMA, visualize, evaluate_fid
 
 class DiTImangenetTrainer:
     def __init__(self, model, diffusion, vae, loader, val_loader, config):
@@ -82,17 +44,24 @@ class DiTImangenetTrainer:
         self.use_amp = getattr(config, 'use_amp', True)
         self.dtype = torch.bfloat16 if self.use_amp else torch.float32
 
-        self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp)
+        # [修复] GradScaler 逻辑：BF16 动态范围足够大，通常不需要 Scaler
+        use_scaler = self.use_amp and (self.dtype == torch.float16)
+        self.scaler = torch.cuda.amp.GradScaler(enabled=use_scaler)
+        
         self.train_loss_history = []
+        
+        # [新增] CFG 训练相关参数
+        self.num_classes = getattr(config, 'num_classes', 1000)
+        self.label_dropout_prob = getattr(config, 'label_dropout_prob', 0.1)
 
         if config.local_rank == 0:
             print(f"Training with AMP: {self.use_amp}, Dtype: {self.dtype}")
+            print(f"GradScaler Enabled: {use_scaler} (Disabled for BF16 recommended)")
             print(f"EMA initialized with decay: {self.ema.decay}, Update Every: {self.ema_update_every} steps")
+            print(f"CFG Label Dropout Prob: {self.label_dropout_prob}")
         
         # [优化] 尝试使用 max-autotune 获得更高性能
         try:
-            # max-autotune 会进行更激进的算子融合 (Triton)，比 default 快 10-20%
-            # 如果显存不够或编译太慢，可回退到 'default'
             compile_mode = getattr(config, 'compile_mode', 'max-autotune') 
             self.model = torch.compile(self.model, mode=compile_mode)
             if config.local_rank == 0:
@@ -101,19 +70,15 @@ class DiTImangenetTrainer:
             print(f"Warning: torch.compile failed: {e}. Fallback to Eager mode.")
 
         self.fid_metric = None
-        # 初始化 FID 逻辑保持不变...
+        # 初始化 FID 逻辑
         try:
             from torchmetrics.image.fid import FrechetInceptionDistance
             self.fid_metric = FrechetInceptionDistance(feature=2048, reset_real_features=True).to(self.device)
+            if self.config.local_rank == 0:
+                print("FID metric initialized successfully.")
         except ImportError:
-            pass
-
-    def _normalize_images(self, images):
-        images = (images + 1.0) / 2.0
-        images = images.clamp(0.0, 1.0)
-        if images.shape[1] == 1:
-            images = images.repeat(1, 3, 1, 1)
-        return (images * 255.0).to(torch.uint8)
+            if self.config.local_rank == 0:
+                print("Warning: torchmetrics not found. FID evaluation will be skipped.")
 
     @torch.no_grad()
     def sample_ddim(self, n, labels, size, num_inference_steps=50, eta=0.0, cfg_scale=4.0, model=None):
@@ -164,50 +129,6 @@ class DiTImangenetTrainer:
             
         return x
 
-    @torch.no_grad()
-    def visualize(self, epoch):
-        if self.config.local_rank != 0: return
-        self.ema.apply_shadow()
-        self.model.eval()
-        try:
-            # Visualization Logic (简化显示)
-            print(f"[Visual] Generating samples for Epoch {epoch}...")
-            n_samples = 4
-            labels = torch.randint(0, 1000, (n_samples,), device=self.device)
-            in_channels = getattr(self.config, 'in_channels', 4)
-            input_size = getattr(self.config, 'input_size', 32)
-            latent_size = (in_channels, input_size, input_size)
-
-            z = self.sample_ddim(n_samples, labels, latent_size, cfg_scale=4.0, model=self.model)
-            x_recon = self.vae.decode(z.float() / 0.18215).sample.float()
-            x_vis = ((x_recon.clamp(-1, 1) + 1.0) / 2.0).clamp(0.0, 1.0)
-            
-            save_path = os.path.join(self.config.results_dir, f"sample_epoch_{epoch}.png")
-            save_image(x_vis, save_path, nrow=2)
-            print(f"[Visual] Saved to {save_path}")
-        finally:
-            self.ema.restore()
-            self.model.train()
-
-    @torch.no_grad()
-    def evaluate_fid(self, epoch, num_gen_batches=10):
-        # 逻辑保持不变，确保 evaluate 不影响训练的 model 状态
-        if self.fid_metric is None: return
-        if self.config.use_ddp: dist.barrier()
-        
-        print(f"[FID] Starting evaluation for Epoch {epoch}...")
-        self.ema.apply_shadow()
-        self.model.eval()
-        self.fid_metric.reset()
-        
-        try:
-            # ... FID 计算代码保持不变 ...
-            pass # (为节省篇幅，沿用您原有的逻辑)
-        finally:
-            self.ema.restore()
-            self.model.train()
-        if self.config.use_ddp: dist.barrier()
-
     def train_one_epoch(self, epoch):
         self.model.train()
         # [优化] 使用 inference_mode 而不是 no_grad (如果 VAE 冻结)
@@ -234,9 +155,20 @@ class DiTImangenetTrainer:
                     latents = posterior.sample() * 0.18215
                 else:
                     latents = images * 0.18215
+                
+                # [新增] Latent Clamping 防止数值爆炸 (Stability Fix)
+                # 标准 VAE latent 范围通常在 -4 到 4 之间，截断 outlier 可防 NaN
+                latents = latents.clamp(-4.0, 4.0)
             
             t = torch.randint(0, self.diffusion.num_timesteps - 10, (images.shape[0],), device=self.device)
             
+            # [新增] Label Dropout (CFG Training)
+            # 以 label_dropout_prob 的概率随机丢弃条件，替换为 null_idx
+            if self.label_dropout_prob > 0:
+                mask = torch.rand(labels.shape, device=self.device) < self.label_dropout_prob
+                # 构造新的 label tensor，避免原地修改
+                labels = torch.where(mask, torch.tensor(self.num_classes, device=self.device), labels)
+
             # Forward & Backward
             with torch.amp.autocast('cuda', dtype=self.dtype, enabled=self.use_amp):
                 loss_dict = self.diffusion.training_losses(self.model, latents, t, model_kwargs=dict(y=labels))
@@ -244,8 +176,11 @@ class DiTImangenetTrainer:
             
             self.optimizer.zero_grad(set_to_none=True) # [优化] set_to_none 稍微快一点
             self.scaler.scale(loss).backward()
+            
+            # [新增] Unscale 后获取 Gradient Norm 用于监控
             self.scaler.unscale_(self.optimizer)
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+            grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+            
             self.scaler.step(self.optimizer)
             self.scaler.update()
             
@@ -265,7 +200,8 @@ class DiTImangenetTrainer:
                 
                 if self.config.local_rank == 0:
                     current_lr = self.optimizer.param_groups[0]['lr']
-                    print(f"Epoch {epoch} | Step {step} | Loss: {avg_loss:.4f} | LR: {current_lr:.2e} | Time: {time() - start_time:.2f}s")
+                    # [新增] 打印 GradNorm
+                    print(f"Epoch {epoch} | Step {step} | Loss: {avg_loss:.4f} | GNorm: {grad_norm:.2f} | LR: {current_lr:.2e} | Time: {time() - start_time:.2f}s")
                 
                 # 重置计数器
                 running_loss = torch.tensor(0.0, device=self.device)
@@ -275,10 +211,12 @@ class DiTImangenetTrainer:
         if self.config.local_rank == 0:
             viz_interval = getattr(self.config, 'log_interval', 1)
             if epoch % viz_interval == 0:
-                self.visualize(epoch)
+                # [修改] 使用 utilz 中的函数，传入 self
+                visualize(self, epoch)
             
         if epoch > 0 and epoch % 10 == 0:
-             self.evaluate_fid(epoch)
+             # [修改] 使用 utilz 中的函数，传入 self
+             evaluate_fid(self, epoch)
 
         # 返回 None 或估计值，不再强求精确的 epoch average 以避免额外同步
         return None 
@@ -298,7 +236,6 @@ class DiTImangenetTrainer:
             latest_path = os.path.join(self.config.results_dir, "latest.pt")
             torch.save(checkpoint, latest_path)
 
-    # resume_checkpoint 保持不变...
     def resume_checkpoint(self, checkpoint_path):
         print(f"Loading checkpoint from {checkpoint_path}...")
         checkpoint = torch.load(checkpoint_path, map_location=self.device)
