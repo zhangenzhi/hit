@@ -6,7 +6,6 @@ import numpy as np
 from time import time
 from copy import deepcopy
 
-# [修改] 导入所有辅助类和函数，包括 save/resume checkpoint
 from train.utilz import EMA, visualize, evaluate_fid
 
 class DiTImangenetTrainer:
@@ -18,19 +17,16 @@ class DiTImangenetTrainer:
         self.vae = vae.to(self.device).eval() 
         self.diffusion = diffusion
         
-        # [优化] DDP 参数调优
+        # DDP setup
         if config.use_ddp:
             self.model = DDP(
                 self.model, 
                 device_ids=[config.local_rank],
-                # [关键优化] 减少梯度桶的内存拷贝，加速同步
                 gradient_as_bucket_view=True, 
-                # 如果输入图像尺寸固定，开启此项可加速
                 static_graph=getattr(config, 'static_graph', True) 
             )
             
         self.ema = EMA(self.model, decay=0.9999)
-        # [新增] EMA 更新频率，默认每 10 步更新一次，减少显存读写压力
         self.ema_update_every = getattr(config, 'ema_update_every', 10)
             
         self.optimizer = torch.optim.AdamW(
@@ -44,13 +40,12 @@ class DiTImangenetTrainer:
         self.use_amp = getattr(config, 'use_amp', True)
         self.dtype = torch.bfloat16 if self.use_amp else torch.float32
 
-        # [修复] GradScaler 逻辑：BF16 动态范围足够大，通常不需要 Scaler
+        # BF16 dynamic range is usually large enough, so Scaler is often not needed
         use_scaler = self.use_amp and (self.dtype == torch.float16)
         self.scaler = torch.cuda.amp.GradScaler(enabled=use_scaler)
         
         self.train_loss_history = []
         
-        # [新增] CFG 训练相关参数
         self.num_classes = getattr(config, 'num_classes', 1000)
         self.label_dropout_prob = getattr(config, 'label_dropout_prob', 0.1)
 
@@ -60,7 +55,6 @@ class DiTImangenetTrainer:
             print(f"EMA initialized with decay: {self.ema.decay}, Update Every: {self.ema_update_every} steps")
             print(f"CFG Label Dropout Prob: {self.label_dropout_prob}")
         
-        # [优化] 尝试使用 max-autotune 获得更高性能
         try:
             compile_mode = getattr(config, 'compile_mode', 'max-autotune') 
             self.model = torch.compile(self.model, mode=compile_mode)
@@ -70,7 +64,7 @@ class DiTImangenetTrainer:
             print(f"Warning: torch.compile failed: {e}. Fallback to Eager mode.")
 
         self.fid_metric = None
-        # 初始化 FID 逻辑
+        # Initialize FID metric
         try:
             from torchmetrics.image.fid import FrechetInceptionDistance
             self.fid_metric = FrechetInceptionDistance(feature=2048, reset_real_features=True).to(self.device)
@@ -82,7 +76,6 @@ class DiTImangenetTrainer:
 
     @torch.no_grad()
     def sample_ddim(self, n, labels, size, num_inference_steps=50, eta=0.0, cfg_scale=4.0, model=None):
-        # 保持您原有的逻辑不变 (包含避开 999 步的逻辑)
         use_model = model if model is not None else self.model
         use_model.eval()
         raw_model = use_model.module if hasattr(use_model, 'module') else use_model
@@ -131,14 +124,11 @@ class DiTImangenetTrainer:
 
     def train_one_epoch(self, epoch):
         self.model.train()
-        # [优化] 使用 inference_mode 而不是 no_grad (如果 VAE 冻结)
         self.vae.eval()
         
         start_time = time()
         max_steps = getattr(self.config, 'max_train_steps', None)
         
-        # [关键优化] 移除 epoch_loss 累加器中的 .item()
-        # 改用 running_loss 在 GPU 上累积，仅在打印时同步
         running_loss = torch.tensor(0.0, device=self.device)
         log_steps = 0
         
@@ -156,17 +146,13 @@ class DiTImangenetTrainer:
                 else:
                     latents = images * 0.18215
                 
-                # [新增] Latent Clamping 防止数值爆炸 (Stability Fix)
-                # 标准 VAE latent 范围通常在 -4 到 4 之间，截断 outlier 可防 NaN
-                latents = latents.clamp(-4.0, 4.0)
+                # latents = latents.clamp(-4.0, 4.0)
             
-            t = torch.randint(0, self.diffusion.num_timesteps - 10, (images.shape[0],), device=self.device)
+            t = torch.randint(0, self.diffusion.num_timesteps, (images.shape[0],), device=self.device)
             
-            # [新增] Label Dropout (CFG Training)
-            # 以 label_dropout_prob 的概率随机丢弃条件，替换为 null_idx
+            # Label Dropout (CFG Training)
             if self.label_dropout_prob > 0:
                 mask = torch.rand(labels.shape, device=self.device) < self.label_dropout_prob
-                # 构造新的 label tensor，避免原地修改
                 labels = torch.where(mask, torch.tensor(self.num_classes, device=self.device), labels)
 
             # Forward & Backward
@@ -174,36 +160,29 @@ class DiTImangenetTrainer:
                 loss_dict = self.diffusion.training_losses(self.model, latents, t, model_kwargs=dict(y=labels))
                 loss = loss_dict["loss"].mean()
             
-            self.optimizer.zero_grad(set_to_none=True) # [优化] set_to_none 稍微快一点
+            self.optimizer.zero_grad(set_to_none=True)
             self.scaler.scale(loss).backward()
             
-            # [新增] Unscale 后获取 Gradient Norm 用于监控
             self.scaler.unscale_(self.optimizer)
             grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
             
             self.scaler.step(self.optimizer)
             self.scaler.update()
             
-            # [关键优化] 稀疏 EMA 更新
             if step % self.ema_update_every == 0:
                 self.ema.update()
             
-            # [关键优化] 异步 Loss 记录
-            # detach 防止计算图累积，但不调用 .item()
+            # Async loss recording
             running_loss += loss.detach()
             log_steps += 1
             
-            # 仅在需要打印日志时才触发 CUDA 同步
             if step % 100 == 0:
-                # 这里的 .item() 会导致同步，但每 100 步一次是可以接受的
                 avg_loss = running_loss.item() / log_steps
                 
                 if self.config.local_rank == 0:
                     current_lr = self.optimizer.param_groups[0]['lr']
-                    # [新增] 打印 GradNorm
                     print(f"Epoch {epoch} | Step {step} | Loss: {avg_loss:.4f} | GNorm: {grad_norm:.2f} | LR: {current_lr:.2e} | Time: {time() - start_time:.2f}s")
                 
-                # 重置计数器
                 running_loss = torch.tensor(0.0, device=self.device)
                 log_steps = 0
                 start_time = time()
@@ -211,12 +190,9 @@ class DiTImangenetTrainer:
         if self.config.local_rank == 0:
             viz_interval = getattr(self.config, 'log_interval', 1)
             if epoch % viz_interval == 0:
-                # [修改] 使用 utilz 中的函数，传入 self
                 visualize(self, epoch)
             
         if epoch > 0 and epoch % 10 == 0:
-             # [修改] 使用 utilz 中的函数，传入 self
              evaluate_fid(self, epoch)
 
-        # 返回 None 或估计值，不再强求精确的 epoch average 以避免额外同步
         return None
