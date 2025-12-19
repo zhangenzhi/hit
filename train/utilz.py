@@ -74,7 +74,7 @@ def visualize(trainer, epoch):
         latent_size = (in_channels, input_size, input_size)
 
         # 调用 trainer 的 sample_ddim 方法
-        z = trainer.sample_ddim(n_samples, labels, latent_size, cfg_scale=4.0, model=trainer.model)
+        z = trainer.sample_ddim(n_samples, labels, latent_size, cfg_scale=1.0, model=trainer.model)
         x_recon = trainer.vae.decode(z.float() / 0.18215).sample.float()
         x_vis = ((x_recon.clamp(-1, 1) + 1.0) / 2.0).clamp(0.0, 1.0)
         
@@ -143,7 +143,7 @@ def evaluate_fid(trainer, epoch, num_gen_batches=10):
             latent_size = (in_channels, input_size, input_size)
             
             # 采样使用 cfg=4.0 和 无截断策略
-            z = trainer.sample_ddim(n_samples, labels, latent_size, num_inference_steps=50, cfg_scale=4.0, model=trainer.model)
+            z = trainer.sample_ddim(n_samples, labels, latent_size, num_inference_steps=50, cfg_scale=1.0, model=trainer.model)
             z = z.float()
             
             # 分块解码
