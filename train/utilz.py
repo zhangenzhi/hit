@@ -194,7 +194,7 @@ def resume_checkpoint(trainer, checkpoint_path):
     恢复 Checkpoint
     """
     print(f"Loading checkpoint from {checkpoint_path}...")
-    checkpoint = torch.load(checkpoint_path, map_location=trainer.device)
+    checkpoint = torch.load(checkpoint_path, map_location=trainer.device,weights_only=False)
     
     model_state_dict = checkpoint["model"]
     # 处理可能的 DDP 前缀不匹配
