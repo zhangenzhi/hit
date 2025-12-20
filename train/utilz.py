@@ -2,6 +2,22 @@ import torch
 import os
 import torch.distributed as dist
 from torchvision.utils import save_image
+from torch.optim.lr_scheduler import LambdaLR
+
+import math
+def get_cosine_schedule_with_warmup(optimizer, num_warmup_steps, num_training_steps, num_cycles=0.5):
+    """
+    创建一个带有 warmup 的 cosine 学习率调度器。
+    """
+    def lr_lambda(current_step):
+        # Warmup 阶段: 线性增加
+        if current_step < num_warmup_steps:
+            return float(current_step) / float(max(1, num_warmup_steps))
+        # Decay 阶段: Cosine 衰减
+        progress = float(current_step - num_warmup_steps) / float(max(1, num_training_steps - num_warmup_steps))
+        return max(0.0, 0.5 * (1.0 + math.cos(math.pi * float(num_cycles) * 2.0 * progress)))
+
+    return LambdaLR(optimizer, lr_lambda)
 
 class EMA:
     """

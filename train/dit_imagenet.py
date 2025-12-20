@@ -5,8 +5,9 @@ import os
 import numpy as np
 from time import time
 from copy import deepcopy
+import math
 
-from train.utilz import EMA, visualize, evaluate_fid
+from train.utilz import EMA, visualize, evaluate_fid, get_cosine_schedule_with_warmup
 
 class DiTImangenetTrainer:
     def __init__(self, model, diffusion, vae, loader, val_loader, config):
@@ -26,8 +27,9 @@ class DiTImangenetTrainer:
                 static_graph=getattr(config, 'static_graph', True) 
             )
             
+        # [Critical Fix] 建议将 ema_update_every 设为 1 以避免 EMA 滞后
+        self.ema_update_every = getattr(config, 'ema_update_every', 1)
         self.ema = EMA(self.model, decay=0.999)
-        self.ema_update_every = getattr(config, 'ema_update_every', 10)
             
         self.optimizer = torch.optim.AdamW(
             self.model.parameters(), 
@@ -37,6 +39,29 @@ class DiTImangenetTrainer:
         self.loader = loader
         self.val_loader = val_loader
         
+        # --- 初始化 Learning Rate Scheduler (Cosine + Warmup) ---
+        # 计算总步数
+        total_epochs = getattr(config, 'epochs', 100)
+        steps_per_epoch = len(self.loader)
+        num_training_steps = total_epochs * steps_per_epoch
+        
+        # 默认 Warmup 为总 Epoch 的 10% (例如 400 epochs -> 40 epochs warmup)
+        # 也可以在 config 中指定 warmup_epochs
+        warmup_epochs = getattr(config, 'warmup_epochs', int(total_epochs * 0.1))
+        num_warmup_steps = warmup_epochs * steps_per_epoch
+        
+        if config.local_rank == 0:
+            print(f"[Scheduler] Initializing Cosine Decay with Warmup")
+            print(f"  - Total Steps: {num_training_steps}")
+            print(f"  - Warmup Steps: {num_warmup_steps} ({warmup_epochs} epochs)")
+            
+        self.scheduler = get_cosine_schedule_with_warmup(
+            self.optimizer, 
+            num_warmup_steps=num_warmup_steps, 
+            num_training_steps=num_training_steps
+        )
+        # --------------------------------------------------------
+
         self.use_amp = getattr(config, 'use_amp', True)
         self.dtype = torch.bfloat16 if self.use_amp else torch.float32
 
@@ -168,6 +193,9 @@ class DiTImangenetTrainer:
             
             self.scaler.step(self.optimizer)
             self.scaler.update()
+            
+            # [新增] 更新 Learning Rate Scheduler
+            self.scheduler.step()
             
             if step % self.ema_update_every == 0:
                 self.ema.update()
