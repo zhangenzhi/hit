@@ -95,84 +95,84 @@ class GaussianDiffusion:
             + _extract_into_tensor(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * noise
         )
 
-    # def _predict_xstart_from_eps(self, x_t, t, eps):
-    #     return (
-    #         _extract_into_tensor(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t
-    #         - _extract_into_tensor(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape) * eps
-    #     )
+    def _predict_xstart_from_eps(self, x_t, t, eps):
+        return (
+            _extract_into_tensor(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t
+            - _extract_into_tensor(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape) * eps
+        )
 
-    # def q_posterior_mean_variance(self, x_start, x_t, t):
-    #     posterior_mean = (
-    #         _extract_into_tensor(self.posterior_mean_coef1, t, x_t.shape) * x_start
-    #         + _extract_into_tensor(self.posterior_mean_coef2, t, x_t.shape) * x_t
-    #     )
-    #     posterior_variance = _extract_into_tensor(self.posterior_variance, t, x_t.shape)
-    #     posterior_log_variance_clipped = _extract_into_tensor(
-    #         self.posterior_log_variance_clipped, t, x_t.shape
-    #     )
-    #     return posterior_mean, posterior_variance, posterior_log_variance_clipped
+    def q_posterior_mean_variance(self, x_start, x_t, t):
+        posterior_mean = (
+            _extract_into_tensor(self.posterior_mean_coef1, t, x_t.shape) * x_start
+            + _extract_into_tensor(self.posterior_mean_coef2, t, x_t.shape) * x_t
+        )
+        posterior_variance = _extract_into_tensor(self.posterior_variance, t, x_t.shape)
+        posterior_log_variance_clipped = _extract_into_tensor(
+            self.posterior_log_variance_clipped, t, x_t.shape
+        )
+        return posterior_mean, posterior_variance, posterior_log_variance_clipped
 
-    # # [FIX] Default clip_denoised set to False for Latent Diffusion
-    # def p_mean_variance(self, model, x, t, clip_denoised=False, model_kwargs=None):
-    #     if model_kwargs is None:
-    #         model_kwargs = {}
+    # [FIX] Default clip_denoised set to False for Latent Diffusion
+    def p_mean_variance(self, model, x, t, clip_denoised=False, model_kwargs=None):
+        if model_kwargs is None:
+            model_kwargs = {}
 
-    #     B, C = x.shape[:2]
-    #     model_output = model(x, t, **model_kwargs)
+        B, C = x.shape[:2]
+        model_output = model(x, t, **model_kwargs)
 
-    #     if model_output.shape[1] == 2 * C:
-    #         model_output, model_var_values = th.split(model_output, C, dim=1)
-    #         min_log = _extract_into_tensor(self.posterior_log_variance_clipped, t, x.shape)
-    #         max_log = _extract_into_tensor(th.log(self.betas), t, x.shape)
-    #         frac = (model_var_values + 1) / 2
-    #         model_log_variance = frac * max_log + (1 - frac) * min_log
-    #         model_variance = th.exp(model_log_variance)
-    #     else:
-    #         model_variance, model_log_variance = (
-    #             self.posterior_variance,
-    #             self.posterior_log_variance_clipped,
-    #         )
-    #         model_variance = _extract_into_tensor(model_variance, t, x.shape)
-    #         model_log_variance = _extract_into_tensor(model_log_variance, t, x.shape)
+        if model_output.shape[1] == 2 * C:
+            model_output, model_var_values = th.split(model_output, C, dim=1)
+            min_log = _extract_into_tensor(self.posterior_log_variance_clipped, t, x.shape)
+            max_log = _extract_into_tensor(th.log(self.betas), t, x.shape)
+            frac = (model_var_values + 1) / 2
+            model_log_variance = frac * max_log + (1 - frac) * min_log
+            model_variance = th.exp(model_log_variance)
+        else:
+            model_variance, model_log_variance = (
+                self.posterior_variance,
+                self.posterior_log_variance_clipped,
+            )
+            model_variance = _extract_into_tensor(model_variance, t, x.shape)
+            model_log_variance = _extract_into_tensor(model_log_variance, t, x.shape)
 
-    #     def process_xstart(x):
-    #         if clip_denoised:
-    #             # [Note] Only safe for pixel space, dangerous for latent space
-    #             return x.clamp(-1, 1)
-    #         return x
+        def process_xstart(x):
+            if clip_denoised:
+                # [Note] Only safe for pixel space, dangerous for latent space
+                return x.clamp(-1, 1)
+            return x
 
-    #     pred_xstart = process_xstart(
-    #         self._predict_xstart_from_eps(x_t=x, t=t, eps=model_output)
-    #     )
+        pred_xstart = process_xstart(
+            self._predict_xstart_from_eps(x_t=x, t=t, eps=model_output)
+        )
         
-    #     model_mean, _, _ = self.q_posterior_mean_variance(x_start=pred_xstart, x_t=x, t=t)
+        model_mean, _, _ = self.q_posterior_mean_variance(x_start=pred_xstart, x_t=x, t=t)
 
-    #     return {
-    #         "mean": model_mean,
-    #         "variance": model_variance,
-    #         "log_variance": model_log_variance,
-    #         "pred_xstart": pred_xstart,
-    #     }
+        return {
+            "mean": model_mean,
+            "variance": model_variance,
+            "log_variance": model_log_variance,
+            "pred_xstart": pred_xstart,
+        }
 
-    # # [FIX] Default clip_denoised set to False
-    # def _vb_terms_bpd(self, model, x_start, x_t, t, clip_denoised=False, model_kwargs=None):
-    #     true_mean, _, true_log_variance_clipped = self.q_posterior_mean_variance(
-    #         x_start=x_start, x_t=x_t, t=t
-    #     )
-    #     out = self.p_mean_variance(
-    #         model, x_t, t, clip_denoised=clip_denoised, model_kwargs=model_kwargs
-    #     )
-    #     kl = normal_kl(
-    #         true_mean, true_log_variance_clipped, out["mean"], out["log_variance"]
-    #     )
-    #     kl = mean_flat(kl) / np.log(2.0)
+    # [FIX] Default clip_denoised set to False
+    def _vb_terms_bpd(self, model, x_start, x_t, t, clip_denoised=False, model_kwargs=None):
+        true_mean, _, true_log_variance_clipped = self.q_posterior_mean_variance(
+            x_start=x_start, x_t=x_t, t=t
+        )
+        out = self.p_mean_variance(
+            model, x_t, t, clip_denoised=clip_denoised, model_kwargs=model_kwargs
+        )
+        kl = normal_kl(
+            true_mean, true_log_variance_clipped, out["mean"], out["log_variance"]
+        )
+        kl = mean_flat(kl) / np.log(2.0)
 
-    #     decoder_nll = -discretized_gaussian_log_likelihood(
-    #         x_start, means=out["mean"], log_scales=0.5 * out["log_variance"]
-    #     )
-    #     decoder_nll = mean_flat(decoder_nll) / np.log(2.0)
-    #     output = th.where((t == 0), decoder_nll, kl)
-    #     return {"output": output, "pred_xstart": out["pred_xstart"]}
+        decoder_nll = -discretized_gaussian_log_likelihood(
+            x_start, means=out["mean"], log_scales=0.5 * out["log_variance"]
+        )
+        decoder_nll = mean_flat(decoder_nll) / np.log(2.0)
+        output = th.where((t == 0), decoder_nll, kl)
+        return {"output": output, "pred_xstart": out["pred_xstart"]}
 
     def training_losses(self, model, x_start, t, model_kwargs=None, noise=None):
         if model_kwargs is None:
@@ -185,29 +185,29 @@ class GaussianDiffusion:
         model_output = model(x_t, t, **model_kwargs)
 
         B, C = x_t.shape[:2]
-        # if model_output.shape[1] == 2 * C:
-        model_output, model_var_values = th.split(model_output, C, dim=1)
-        #     frozen_out = th.cat([model_output.detach(), model_var_values], dim=1)
+        if model_output.shape[1] == 2 * C:
+            model_output, model_var_values = th.split(model_output, C, dim=1)
+            frozen_out = th.cat([model_output.detach(), model_var_values], dim=1)
             
-        #     # [FIX] Ensure clip_denoised=False for VLB calculation on latents
-        #     terms["vb"] = self._vb_terms_bpd(
-        #         model=lambda *args, r=frozen_out: r,
-        #         x_start=x_start,
-        #         x_t=x_t,
-        #         t=t,
-        #         clip_denoised=True, 
-        #     )["output"]
+            # [FIX] Ensure clip_denoised=False for VLB calculation on latents
+            terms["vb"] = self._vb_terms_bpd(
+                model=lambda *args, r=frozen_out: r,
+                x_start=x_start,
+                x_t=x_t,
+                t=t,
+                clip_denoised=True, 
+            )["output"]
             
-        #     # [CRITICAL FIX] Use 1e-3 weight for VLB loss.
-        #     # Previously it was (num_timesteps/1000.0) which is ~1.0, overwhelming the MSE loss.
-        #     terms["vb"] *= 1.0
+            # [CRITICAL FIX] Use 1e-3 weight for VLB loss.
+            # Previously it was (num_timesteps/1000.0) which is ~1.0, overwhelming the MSE loss.
+            terms["vb"] *= 1e-3
 
         target = noise
         terms["mse"] = mean_flat((target - model_output) ** 2)
         
         if "vb" in terms:
-            # terms["loss"] = terms["mse"] + terms["vb"]
-            terms["loss"] = terms["mse"]
+            terms["loss"] = terms["mse"] + terms["vb"]
+            # terms["loss"] = terms["mse"]
         else:
             terms["loss"] = terms["mse"]
 
