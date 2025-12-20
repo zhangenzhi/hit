@@ -8,7 +8,7 @@ class EMA:
     指数移动平均 (Exponential Moving Average) 用于模型参数平滑。
     通常能显著提升生成模型的 FID 分数。
     """
-    def __init__(self, model, decay=0.9999):
+    def __init__(self, model, decay=0.999):
         self.model = model
         self.decay = decay
         self.shadow = {}
