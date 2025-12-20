@@ -26,7 +26,7 @@ class DiTImangenetTrainer:
                 static_graph=getattr(config, 'static_graph', True) 
             )
             
-        self.ema = EMA(self.model, decay=0.9999)
+        self.ema = EMA(self.model, decay=0.999)
         self.ema_update_every = getattr(config, 'ema_update_every', 10)
             
         self.optimizer = torch.optim.AdamW(
