@@ -29,7 +29,7 @@ class DiTImangenetTrainer:
             
         # [Critical Fix] 建议将 ema_update_every 设为 1 以避免 EMA 滞后
         self.ema_update_every = getattr(config, 'ema_update_every', 1)
-        self.ema = EMA(self.model, decay=0.999)
+        self.ema = EMA(self.model, decay=0.9999)
             
         self.optimizer = torch.optim.AdamW(
             self.model.parameters(), 
