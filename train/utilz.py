@@ -159,7 +159,7 @@ def evaluate_fid(trainer, epoch, num_gen_batches=10):
             latent_size = (in_channels, input_size, input_size)
             
             # 采样使用 cfg=4.0 和 无截断策略
-            z = trainer.sample_ddim(n_samples, labels, latent_size, num_inference_steps=50, cfg_scale=4.0, model=trainer.model)
+            z = trainer.sample_ddim(n_samples, labels, latent_size, num_inference_steps=250, cfg_scale=1.5, model=trainer.model)
             z = z.float()
             
             # 分块解码
