@@ -76,14 +76,15 @@ class DiTImangenetTrainer:
             if self.config.local_rank == 0:
                 print("Warning: torchmetrics not found. FID evaluation will be skipped.")
 
-    @torch.no_grad()
+@torch.no_grad()
     def sample_ddim(self, n, labels, size, num_inference_steps=50, eta=0.0, cfg_scale=4.0, model=None):
         use_model = model if model is not None else self.model
         use_model.eval()
         raw_model = use_model.module if hasattr(use_model, 'module') else use_model
         
-        step_ratio = self.diffusion.num_timesteps // num_inference_steps
-        timesteps = (np.arange(0, num_inference_steps) * step_ratio).round()[::-1].copy().astype(int)
+        # [修改 1] 使用 linspace 生成均匀分布的时间步，确保覆盖从 999 到 0
+        # 例如 50 步: [999, 978, 958, ..., 20, 0]
+        timesteps = np.linspace(0, self.diffusion.num_timesteps - 1, num_inference_steps, dtype=int)[::-1].copy()
         
         x = torch.randn(n, *size).to(self.device)
         C = x.shape[1]
@@ -103,13 +104,21 @@ class DiTImangenetTrainer:
                 model_output = raw_model(x_in, t_in, y_in)
             
             model_output = model_output.float()
-            eps = model_output[:, :C]
+            
+            # [细节] 如果模型输出了方差通道，只取前半部分 epsilon
+            if model_output.shape[1] == 2 * C:
+                model_output, _ = torch.split(model_output, C, dim=1)
+                
+            eps = model_output
             
             if cfg_scale > 1.0:
                 cond_eps, uncond_eps = eps.chunk(2)
                 eps = uncond_eps + cfg_scale * (cond_eps - uncond_eps)
             
+            # --- DDIM Update ---
             alpha_bar_t = self.diffusion.alphas_cumprod[t_step].to(self.device).float()
+            
+            # [逻辑保持] 处理最后一步 t=0 的情况
             if i == len(timesteps) - 1:
                 alpha_bar_t_prev = torch.tensor(1.0, device=self.device).float()
             else:
@@ -117,8 +126,16 @@ class DiTImangenetTrainer:
                 alpha_bar_t_prev = self.diffusion.alphas_cumprod[prev_t].to(self.device).float()
             
             sigma_t = eta * torch.sqrt((1 - alpha_bar_t_prev) / (1 - alpha_bar_t) * (1 - alpha_bar_t / alpha_bar_t_prev))
+            
+            # 预测 x0
             pred_x0 = (x - torch.sqrt(1 - alpha_bar_t) * eps) / torch.sqrt(alpha_bar_t)
+            
+            # [可选] Latent Diffusion 通常不 Clip 到 [-1, 1]，所以这里不加 Clip 是对的
+            # 如果是 Pixel Space，这里应该加: pred_x0 = torch.clamp(pred_x0, -1, 1)
+            
+            # 指向 xt 的方向
             dir_xt = torch.sqrt(1 - alpha_bar_t_prev - sigma_t**2) * eps
+            
             noise = sigma_t * torch.randn_like(x)
             x = torch.sqrt(alpha_bar_t_prev) * pred_x0 + dir_xt + noise
             
