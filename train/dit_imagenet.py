@@ -76,7 +76,7 @@ class DiTImangenetTrainer:
             if self.config.local_rank == 0:
                 print("Warning: torchmetrics not found. FID evaluation will be skipped.")
 
-@torch.no_grad()
+    @torch.no_grad()
     def sample_ddim(self, n, labels, size, num_inference_steps=50, eta=0.0, cfg_scale=4.0, model=None):
         use_model = model if model is not None else self.model
         use_model.eval()
