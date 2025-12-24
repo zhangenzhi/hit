@@ -208,7 +208,6 @@ class GaussianDiffusion:
         
         if "vb" in terms:
             terms["loss"] = terms["mse"] + terms["vb"]
-            # terms["loss"] = terms["mse"]
         else:
             terms["loss"] = terms["mse"]
 
