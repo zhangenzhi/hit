@@ -416,12 +416,10 @@ class DiTImangenetTrainer:
             viz_interval = getattr(self.config, 'log_interval', 1)
             # Visualize / Checkpoints
             if epoch % viz_interval == 0:
-                # [Update] Call class method
                 self.visualize(epoch)
             
             # FID Evaluation
             if epoch > 0 and epoch % 10 == 0:
-                 # [Update] Call class method
                  self.evaluate_fid(epoch)
 
         return None
