@@ -5,10 +5,8 @@ from torchvision.utils import save_image
 import os
 import numpy as np
 from time import time
-from copy import deepcopy
-import math
 
-from train.utilz import EMA, get_cosine_schedule_with_warmup
+from train.utilz import EMA
 
 class DiTImangenetTrainer:
     def __init__(self, model, diffusion, vae, loader, val_loader, config):
