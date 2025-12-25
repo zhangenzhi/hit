@@ -87,8 +87,8 @@ def main():
     flat_config.use_ddp = config.use_ddp
     
     # [新增] 注入新优化的默认参数 (防止 YAML 中缺失)
-    if not hasattr(flat_config, 'ema_update_every'): flat_config.ema_update_every = 10
-    if not hasattr(flat_config, 'compile_mode'): flat_config.compile_mode = 'max-autotune'
+    if not hasattr(flat_config, 'ema_update_every'): flat_config.ema_update_every = 1
+    if not hasattr(flat_config, 'compile_mode'): flat_config.compile_mode = 'default'
     if not hasattr(flat_config, 'label_dropout_prob'): flat_config.label_dropout_prob = 0.1
     
     if flat_config.local_rank == 0:
