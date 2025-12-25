@@ -2,9 +2,9 @@
 
 data:
   # 【关键修改 1】指向预处理好的 Latent 目录
-  # 之前是: /work/c30778/dataset/imagenet/
+  data_path: "/work/c30778/dataset/imagenet/"
   # data_path: "/work/c30778/imagenet_rc10_lat/"
-  data_path: "/work/c30778/imagenet_rc10_lat2/"
+  # data_path: "/work/c30778/imagenet_rc10_lat2/"
   image_size: 256
   num_workers: 32  # Latent 读取很快，可以适当增加 worker
 
@@ -30,10 +30,11 @@ training:
   ema_update_every: 1
   
   # 以前跑 Pixel 时可能只能开 32-64，现在 Latent 模式下 H100 可以轻松跑 128-256
-  batch_size: 256     
+  # batch_size: 256     
+  batch_size: 64  
   
   lr: 0.0001          # 2e-4
-  results_dir: "./results/dit_b_2_latent-cfg4-s250-vlb1-lat2-sp"
+  results_dir: "./results/dit_b_2_pixel-cfg4-s250-vlb1-lat2-sp"
   use_amp: True       # 混合精度
   seed: 42
   log_interval: 1
