@@ -34,7 +34,7 @@ training:
   batch_size: 64  
   
   lr: 0.0001          # 2e-4
-  results_dir: "./results/dit_b_2_pixel-cfg4-s250-vlb1-lat2-sp"
+  results_dir: "./results/dit_b_2_pixel-cfg4-s250-vlb1-sp"
   use_amp: True       # 混合精度
   seed: 42
   log_interval: 1
