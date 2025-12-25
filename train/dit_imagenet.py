@@ -267,7 +267,7 @@ class DiTImangenetTrainer:
                     posterior = self.vae.encode(images).latent_dist
                     latents = posterior.sample() * 0.18215
                 else:
-                    latents = images
+                    latents = images * 0.18215
             
             t = torch.randint(0, self.diffusion.num_timesteps, (latents.shape[0],), device=self.device)
             
