@@ -1,6 +1,6 @@
 #!/bin/sh
 #------ qsub option --------#
-#PBS -q lg
+#PBS -q sg
 #PBS -l select=1:ngpus=4:mpiprocs=4
 #PBS -l walltime=16:00:00
 #PBS -W group_list=c30636
