@@ -1,8 +1,8 @@
 #!/bin/sh
 #------ qsub option --------#
 #PBS -q lg
-#PBS -l select=2:ngpus=4:mpiprocs=4
-#PBS -l walltime=8:00:00
+#PBS -l select=4:ngpus=4:mpiprocs=4
+#PBS -l walltime=16:00:00
 #PBS -W group_list=c30636
 #PBS -j oe
 
@@ -57,7 +57,7 @@ conda activate hde
 
 # 5. 启动命令
 # 务必通过 -x 传递 DETECTED_IFNAME 相关的变量
-mpirun -np 2 \
+mpirun -np 4 \
     --map-by ppr:1:node \
     --bind-to none \
     -x MASTER_ADDR \
@@ -70,7 +70,7 @@ mpirun -np 2 \
     -x NCCL_DEBUG \
     -x PATH \
     torchrun \
-    --nnodes=2 \
+    --nnodes=4 \
     --nproc_per_node=4 \
     --rdzv_id=$PBS_JOBID \
     --rdzv_backend=c10d \

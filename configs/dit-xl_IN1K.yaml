@@ -30,7 +30,7 @@ training:
   batch_size: 128     
   
   lr: 0.0001          # 1e-4
-  results_dir: "./results/dit_xl_2_latent-ema-bz1k"
+  results_dir: "./results/dit_xl_2_latent-n4-ema-bz2k"
   use_amp: True       # 混合精度
   seed: 42
   log_interval: 1
