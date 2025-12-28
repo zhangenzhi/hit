@@ -79,7 +79,7 @@ def visualize(trainer, epoch):
     """
     if trainer.config.local_rank != 0: return
     
-    trainer.ema.apply_shadow()
+    # trainer.ema.apply_shadow()
     trainer.model.eval()
     try:
         print(f"[Visual] Generating samples for Epoch {epoch}...")
@@ -98,7 +98,7 @@ def visualize(trainer, epoch):
         save_image(x_vis, save_path, nrow=2)
         print(f"[Visual] Saved to {save_path}")
     finally:
-        trainer.ema.restore()
+        # trainer.ema.restore()
         trainer.model.train()
 
 @torch.no_grad()
@@ -112,7 +112,7 @@ def evaluate_fid(trainer, epoch, num_gen_batches=10):
         dist.barrier()
     
     print(f"[FID] Starting evaluation for Epoch {epoch}...")
-    trainer.ema.apply_shadow()
+    # trainer.ema.apply_shadow()
     trainer.model.eval()
     trainer.fid_metric.reset()
     
@@ -181,7 +181,7 @@ def evaluate_fid(trainer, epoch, num_gen_batches=10):
             with open(os.path.join(trainer.config.results_dir, "fid_log.txt"), "a") as f:
                 f.write(f"Epoch {epoch}, FID: {fid_score.item():.4f}\n")
     finally:
-        trainer.ema.restore()
+        # trainer.ema.restore()
         trainer.model.train()
         torch.cuda.empty_cache()
     if trainer.config.use_ddp:
@@ -195,7 +195,7 @@ def save_checkpoint(trainer, epoch, avg_loss=None):
         checkpoint_path = os.path.join(trainer.config.results_dir, f"checkpoint_{epoch}.pt")
         checkpoint = {
             "model": trainer.model.module.state_dict() if trainer.config.use_ddp else trainer.model.state_dict(),
-            "ema": trainer.ema.shadow, 
+            # "ema": trainer.ema.shadow, 
             "optimizer": trainer.optimizer.state_dict(),
             "epoch": epoch,
             "config": trainer.config,
@@ -226,10 +226,10 @@ def resume_checkpoint(trainer, checkpoint_path):
                     new_state_dict[k] = v
             trainer.model.load_state_dict(new_state_dict)
         
-    if "ema" in checkpoint:
-        trainer.ema.shadow = checkpoint["ema"]
-    else:
-        trainer.ema.register()
+    # if "ema" in checkpoint:
+    #     trainer.ema.shadow = checkpoint["ema"]
+    # else:
+    #     trainer.ema.register()
 
     if "optimizer" in checkpoint and trainer.optimizer is not None:
         trainer.optimizer.load_state_dict(checkpoint["optimizer"])

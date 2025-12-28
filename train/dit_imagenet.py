@@ -27,9 +27,9 @@ class DiTImangenetTrainer:
                 static_graph=getattr(config, 'static_graph', True) 
             )
             
-        # [Critical Fix] 建议将 ema_update_every 设为 1 以避免 EMA 滞后
-        self.ema_update_every = getattr(config, 'ema_update_every', 1)
-        self.ema = EMA(self.model, decay=0.9999)
+        # # [Critical Fix] 建议将 ema_update_every 设为 1 以避免 EMA 滞后
+        # self.ema_update_every = getattr(config, 'ema_update_every', 1)
+        # self.ema = EMA(self.model, decay=0.9999)
             
         self.optimizer = torch.optim.AdamW(
             self.model.parameters(), 
@@ -77,7 +77,7 @@ class DiTImangenetTrainer:
         if config.local_rank == 0:
             print(f"Training with AMP: {self.use_amp}, Dtype: {self.dtype}")
             print(f"GradScaler Enabled: {use_scaler} (Disabled for BF16 recommended)")
-            print(f"EMA initialized with decay: {self.ema.decay}, Update Every: {self.ema_update_every} steps")
+            # print(f"EMA initialized with decay: {self.ema.decay}, Update Every: {self.ema_update_every} steps")
             print(f"CFG Label Dropout Prob: {self.label_dropout_prob}")
         
         try:
@@ -197,8 +197,8 @@ class DiTImangenetTrainer:
             # # [新增] 更新 Learning Rate Scheduler
             # self.scheduler.step()
             
-            if step % self.ema_update_every == 0:
-                self.ema.update()
+            # if step % self.ema_update_every == 0:
+            #     self.ema.update()
             
             # Async loss recording
             running_loss += loss.detach()
