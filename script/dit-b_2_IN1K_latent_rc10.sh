@@ -75,4 +75,7 @@ mpirun -np 1 \
     --rdzv_id=$PBS_JOBID \
     --rdzv_backend=c10d \
     --rdzv_endpoint=$MASTER_ADDR:$MASTER_PORT \
-    ./main.py --config ./configs/dit-b_IN1K.yaml
+    ./main.py --config ./configs/dit-b_IN1K.yaml  --resume ./results/dit_b_2_latent-ema-f-bz512/checkpoint_265.pt
+
+
+# --resume ./results/dit_b_2_latent-ema-f-bz512/checkpoint_265.pt
