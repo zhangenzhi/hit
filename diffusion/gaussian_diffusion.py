@@ -225,90 +225,90 @@ class GaussianDiffusion:
                 yield out
                 img = out["sample"]
 
-    def ddim_sample(self, model, x, t, clip_denoised=False, model_kwargs=None, eta=0.0):
-        """
-        Sample x_{t-1} from the model using DDIM.
-        """
-        out = self.p_mean_variance(
-            model,
-            x,
-            t,
-            clip_denoised=clip_denoised,
-            model_kwargs=model_kwargs,
-        )
+    # def ddim_sample(self, model, x, t, clip_denoised=False, model_kwargs=None, eta=0.0):
+    #     """
+    #     Sample x_{t-1} from the model using DDIM.
+    #     """
+    #     out = self.p_mean_variance(
+    #         model,
+    #         x,
+    #         t,
+    #         clip_denoised=clip_denoised,
+    #         model_kwargs=model_kwargs,
+    #     )
         
-        # Usually our model outputs epsilon, but we re-derive it
-        # in case we used x_start or x_prev prediction.
-        eps = self._predict_eps_from_xstart(x, t, out["pred_xstart"])
+    #     # Usually our model outputs epsilon, but we re-derive it
+    #     # in case we used x_start or x_prev prediction.
+    #     eps = self._predict_eps_from_xstart(x, t, out["pred_xstart"])
 
-        alpha_bar = _extract_into_tensor(self.alphas_cumprod, t, x.shape)
-        alpha_bar_prev = _extract_into_tensor(self.alphas_cumprod_prev, t, x.shape)
+    #     alpha_bar = _extract_into_tensor(self.alphas_cumprod, t, x.shape)
+    #     alpha_bar_prev = _extract_into_tensor(self.alphas_cumprod_prev, t, x.shape)
         
-        sigma = (
-            eta
-            * th.sqrt((1 - alpha_bar_prev) / (1 - alpha_bar))
-            * th.sqrt(1 - alpha_bar / alpha_bar_prev)
-        )
+    #     sigma = (
+    #         eta
+    #         * th.sqrt((1 - alpha_bar_prev) / (1 - alpha_bar))
+    #         * th.sqrt(1 - alpha_bar / alpha_bar_prev)
+    #     )
         
-        # Equation 12.
-        noise = th.randn_like(x)
-        mean_pred = (
-            out["pred_xstart"] * th.sqrt(alpha_bar_prev)
-            + th.sqrt(1 - alpha_bar_prev - sigma ** 2) * eps
-        )
+    #     # Equation 12.
+    #     noise = th.randn_like(x)
+    #     mean_pred = (
+    #         out["pred_xstart"] * th.sqrt(alpha_bar_prev)
+    #         + th.sqrt(1 - alpha_bar_prev - sigma ** 2) * eps
+    #     )
         
-        nonzero_mask = (
-            (t != 0).float().view(-1, *([1] * (len(x.shape) - 1)))
-        )  # no noise when t == 0
+    #     nonzero_mask = (
+    #         (t != 0).float().view(-1, *([1] * (len(x.shape) - 1)))
+    #     )  # no noise when t == 0
         
-        sample = mean_pred + nonzero_mask * sigma * noise
-        return {"sample": sample, "pred_xstart": out["pred_xstart"]}
+    #     sample = mean_pred + nonzero_mask * sigma * noise
+    #     return {"sample": sample, "pred_xstart": out["pred_xstart"]}
 
-    def ddim_sample_loop(self, model, shape, noise=None, clip_denoised=False, model_kwargs=None, progress=False, eta=0.0):
-        """
-        Generate samples from the model using DDIM.
-        """
-        final = None
-        for sample in self.ddim_sample_loop_progressive(
-            model,
-            shape,
-            noise=noise,
-            clip_denoised=clip_denoised,
-            model_kwargs=model_kwargs,
-            progress=progress,
-            eta=eta,
-        ):
-            final = sample
-        return final["sample"]
+    # def ddim_sample_loop(self, model, shape, noise=None, clip_denoised=False, model_kwargs=None, progress=False, eta=0.0):
+    #     """
+    #     Generate samples from the model using DDIM.
+    #     """
+    #     final = None
+    #     for sample in self.ddim_sample_loop_progressive(
+    #         model,
+    #         shape,
+    #         noise=noise,
+    #         clip_denoised=clip_denoised,
+    #         model_kwargs=model_kwargs,
+    #         progress=progress,
+    #         eta=eta,
+    #     ):
+    #         final = sample
+    #     return final["sample"]
 
-    def ddim_sample_loop_progressive(self, model, shape, noise=None, clip_denoised=False, model_kwargs=None, progress=False, eta=0.0):
-        """
-        Use DDIM to sample from the model and yield intermediate samples.
-        """
-        if noise is not None:
-            img = noise
-        else:
-            img = th.randn(*shape, device=self.device)
+    # def ddim_sample_loop_progressive(self, model, shape, noise=None, clip_denoised=False, model_kwargs=None, progress=False, eta=0.0):
+    #     """
+    #     Use DDIM to sample from the model and yield intermediate samples.
+    #     """
+    #     if noise is not None:
+    #         img = noise
+    #     else:
+    #         img = th.randn(*shape, device=self.device)
             
-        indices = list(range(self.num_timesteps))[::-1]
+    #     indices = list(range(self.num_timesteps))[::-1]
 
-        if progress:
-            from tqdm.auto import tqdm
-            indices = tqdm(indices)
+    #     if progress:
+    #         from tqdm.auto import tqdm
+    #         indices = tqdm(indices)
 
-        for i in indices:
-            t = th.tensor([i] * shape[0], device=self.device)
-            with th.no_grad():
-                out = self.ddim_sample(
-                    model,
-                    img,
-                    t,
-                    clip_denoised=clip_denoised,
-                    model_kwargs=model_kwargs,
-                    eta=eta,
-                )
-                yield out
-                img = out["sample"]
+    #     for i in indices:
+    #         t = th.tensor([i] * shape[0], device=self.device)
+    #         with th.no_grad():
+    #             out = self.ddim_sample(
+    #                 model,
+    #                 img,
+    #                 t,
+    #                 clip_denoised=clip_denoised,
+    #                 model_kwargs=model_kwargs,
+    #                 eta=eta,
+    #             )
+    #             yield out
+    #             img = out["sample"]
 
     # -------------------------------
 

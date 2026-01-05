@@ -6,7 +6,7 @@ import os
 import numpy as np
 from time import time
 
-from train.utilz import EMA
+# from train.utilz import EMA
 
 class DiTImangenetTrainer:
     def __init__(self, model, diffusion, vae, loader, val_loader, config):
@@ -30,8 +30,8 @@ class DiTImangenetTrainer:
                 static_graph=getattr(config, 'static_graph', True) 
             )
             
-        self.ema_update_every = getattr(config, 'ema_update_every', 1)
-        self.ema = EMA(self.model, decay=0.9999)
+        # self.ema_update_every = getattr(config, 'ema_update_every', 1)
+        # self.ema = EMA(self.model, decay=0.9999)
             
         self.optimizer = torch.optim.AdamW(
             self.model.parameters(), 
@@ -55,7 +55,7 @@ class DiTImangenetTrainer:
         if config.local_rank == 0:
             print(f"Training with AMP: {self.use_amp}, Dtype: {self.dtype}")
             print(f"GradScaler Enabled: {use_scaler} (Disabled for BF16 recommended)")
-            print(f"EMA initialized with decay: {self.ema.decay}, Update Every: {self.ema_update_every} steps")
+            # print(f"EMA initialized with decay: {self.ema.decay}, Update Every: {self.ema_update_every} steps")
             print(f"CFG Label Dropout Prob: {self.label_dropout_prob}")
             print(f"Mode: {'Latent Diffusion' if self.vae else 'Pixel Diffusion'}")
         
@@ -101,7 +101,7 @@ class DiTImangenetTrainer:
         """
         if self.config.local_rank != 0: return
         
-        self.ema.apply_shadow()
+        # self.ema.apply_shadow()
         self.model.eval()
         try:
             print(f"[Visual] Generating samples for Epoch {epoch}...")
@@ -145,7 +145,7 @@ class DiTImangenetTrainer:
             save_image(x_vis, save_path, nrow=2)
             print(f"[Visual] Saved to {save_path}")
         finally:
-            self.ema.restore()
+            # self.ema.restore()
             self.model.train()
 
     @torch.no_grad()
@@ -162,7 +162,7 @@ class DiTImangenetTrainer:
         sample_method = getattr(self.config, 'sample_method', 'ddpm')
         
         print(f"[FID] Starting evaluation for Epoch {epoch} using {sample_method.upper()} sampling...")
-        self.ema.apply_shadow()
+        # self.ema.apply_shadow()
         self.model.eval()
         self.fid_metric.reset()
         
@@ -238,7 +238,7 @@ class DiTImangenetTrainer:
                 with open(os.path.join(self.config.results_dir, "fid_log.txt"), "a") as f:
                     f.write(f"Epoch {epoch}, FID: {fid_score.item():.4f}, Method: {sample_method.upper()}\n")
         finally:
-            self.ema.restore()
+            # self.ema.restore()
             self.model.train()
             torch.cuda.empty_cache()
         if self.config.use_ddp:
@@ -286,8 +286,8 @@ class DiTImangenetTrainer:
             self.scaler.step(self.optimizer)
             self.scaler.update()
             
-            if step % self.ema_update_every == 0:
-                self.ema.update()
+            # if step % self.ema_update_every == 0:
+            #     self.ema.update()
             
             running_loss += loss.detach()
             log_steps += 1

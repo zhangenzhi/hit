@@ -24,6 +24,7 @@ diffusion:
   beta_start: 0.0001
   beta_end: 0.02
   schedule: "cosine"  # 强烈建议使用我们添加的 Cosine Schedule
+  sample_method: "ddpm"
 
 training:
   epochs: 400
