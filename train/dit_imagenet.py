@@ -304,7 +304,7 @@ class DiTImangenetTrainer:
             if epoch % viz_interval == 0:
                 self.visualize(epoch)
             
-            if epoch > 0 and epoch % 10 == 0:
-                 self.evaluate_fid(epoch)
+            # if epoch > 0 and epoch % 10 == 0:
+            #      self.evaluate_fid(epoch)
 
         return None
