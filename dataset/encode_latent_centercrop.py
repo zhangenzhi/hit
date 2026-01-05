@@ -32,7 +32,7 @@ def get_gpu_stats(local_rank, nvml_handle=None):
     return stats
 
 def main():
-    parser = argparse.ArgumentParser(description="Encode ImageNet to Latents (No Crop / Resize Only)")
+    parser = argparse.ArgumentParser(description="Encode ImageNet to Latents (Strict Mode: Stops on Bad Image)")
     parser.add_argument("--data_path", type=str, required=True, help="Path to raw ImageNet directory")
     parser.add_argument("--save_path", type=str, required=True, help="Path to save latents")
     parser.add_argument("--image_size", type=int, default=256)
@@ -92,13 +92,13 @@ def main():
     except Exception as e:
         if is_main_process: print(f"Warning: torch.compile failed, using eager mode. {e}")
 
-    # --- 3. 准备数据增强 (No Crop) ---
+    # --- 3. 准备数据增强 ---
     if is_main_process: 
-        print(f"Mode: No Crop (Force Resize to {args.image_size}x{args.image_size})")
+        print(f"Mode: Deterministic (Resize -> CenterCrop {args.image_size})")
     
     transform = transforms.Compose([
-        # [修改] 使用 tuple (H, W) 强制缩放，不保持长宽比，确保不裁剪
-        transforms.Resize((args.image_size, args.image_size), interpolation=transforms.InterpolationMode.BICUBIC),
+        transforms.Resize(args.image_size, interpolation=transforms.InterpolationMode.BICUBIC),
+        transforms.CenterCrop(args.image_size),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
     ])
@@ -137,17 +137,20 @@ def main():
         def __getitem__(self, idx):
             src, dst_base = self.paths[idx]
             try:
+                # 尝试加载和预处理图片
                 img = Image.open(src).convert("RGB")
                 img_tensor = self.transform(img)
                 return img_tensor, dst_base
             except Exception as e:
-                # 错误处理逻辑保持不变
+                # --- 发现坏图时的处理逻辑 ---
                 error_log_file = "bad_images.txt"
                 error_msg = f"[Rank {rank}] ❌ FATAL ERROR: Bad image found: {src}"
                 
+                # 1. 在控制台打印红色错误信息 (如果终端支持)
                 print(f"\033[91m{error_msg}\033[0m", file=sys.stderr)
                 print(f"Exception details: {e}", file=sys.stderr)
                 
+                # 2. 将坏图路径写入本地文件
                 try:
                     with open(error_log_file, "a") as f:
                         f.write(f"{src}\n")
@@ -155,6 +158,7 @@ def main():
                 except Exception as file_e:
                     print(f"Failed to write to log file: {file_e}", file=sys.stderr)
                 
+                # 3. 抛出 RuntimeError，这会导致 DataLoader worker 崩溃，进而终止主进程
                 raise RuntimeError(f"Terminating encoding due to corrupt image: {src}")
 
     dataset = StrictDataset(my_paths, transform)
@@ -173,8 +177,9 @@ def main():
     # --- 6. 编码循环 ---
     if is_main_process:
         print(f"Start encoding... Outputting Latents.")
-        print(f"NOTE: Images are resized to {args.image_size}x{args.image_size} without cropping (aspect ratio may change).")
+        print(f"NOTE: If a bad image is found, the path will be saved to 'bad_images.txt' and the script will exit.")
     
+    # 使用 try-except 捕获 DataLoader 的异常，确保可以优雅地看到错误信息
     try:
         iterator = tqdm(loader, desc=f"GPU {rank}", disable=not is_main_process)
         
@@ -204,9 +209,10 @@ def main():
                     iterator.set_postfix_str(postfix_str)
 
     except RuntimeError as e:
+        # 当 Worker 抛出异常时，主进程会在这里捕获
         print(f"\n[Rank {rank}] 🛑 Process Interrupted!", file=sys.stderr)
         print(f"Reason: {e}", file=sys.stderr)
-        sys.exit(1)
+        sys.exit(1) # 非零退出码，通知 DDP 或外部调度器任务失败
 
     if is_main_process:
         print(f"Done! Latents saved to {args.save_path}")
