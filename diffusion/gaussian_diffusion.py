@@ -214,19 +214,149 @@ class GaussianDiffusion:
                 yield out
                 img = out["sample"]
 
-    # [FIX] Added alias to support 'sample_ddpm' call from trainer
-    def sample_ddpm(self, model, shape, noise=None, clip_denoised=False, model_kwargs=None, progress=False):
-        return self.p_sample_loop(
-            model, 
-            shape, 
-            noise=noise, 
-            clip_denoised=clip_denoised, 
-            model_kwargs=model_kwargs, 
-            progress=progress
-        )
+    # --- Wrapper for Trainer compatibility ---
+    
+    def sample_ddpm(self, model, labels, size, num_classes, cfg_scale=1.0, use_amp=False, dtype=th.float32, is_latent=False):
+        """
+        Adapter for DiT Trainer to call standard DDPM sampling
+        """
+        n = labels.shape[0]
+        C, H, W = size
+        shape = (n, C, H, W)
+        
+        # Pass labels and cfg_scale to model via kwargs
+        model_kwargs = dict(y=labels, cfg_scale=cfg_scale, num_classes=num_classes)
+        
+        # Use AMP if requested
+        with th.amp.autocast('cuda', enabled=use_amp, dtype=dtype):
+             return self.p_sample_loop(
+                model, 
+                shape, 
+                noise=None, 
+                clip_denoised=False, 
+                model_kwargs=model_kwargs, 
+                progress=True
+            )
 
-    # DDIM methods commented out as in original code...
-    # (keeping them commented to avoid unused code, but user can uncomment if needed)
+    def sample_ddim(self, model, labels, size, num_classes, num_inference_steps=50, cfg_scale=1.0, use_amp=False, dtype=th.float32, is_latent=False):
+        """
+        Adapter for DiT Trainer to call DDIM sampling
+        """
+        n = labels.shape[0]
+        C, H, W = size
+        shape = (n, C, H, W)
+        
+        model_kwargs = dict(y=labels, cfg_scale=cfg_scale, num_classes=num_classes)
+        
+        with th.amp.autocast('cuda', enabled=use_amp, dtype=dtype):
+            return self.ddim_sample_loop(
+                model,
+                shape,
+                num_inference_steps=num_inference_steps,
+                noise=None,
+                clip_denoised=False,
+                model_kwargs=model_kwargs,
+                progress=True
+            )
+
+    # --- DDIM Methods ---
+
+    def ddim_sample(self, model, x, t, next_t, eta=0.0, clip_denoised=False, model_kwargs=None):
+        if model_kwargs is None:
+            model_kwargs = {}
+        
+        # 1. Get prediction of x_start and epsilon
+        out = self.p_mean_variance(
+            model,
+            x,
+            t,
+            clip_denoised=clip_denoised,
+            model_kwargs=model_kwargs,
+        )
+        
+        eps = self._predict_eps_from_xstart(x, t, out["pred_xstart"])
+        
+        # 2. Compute alphas for t and next_t
+        alpha_bar = _extract_into_tensor(self.alphas_cumprod, t, x.shape)
+        
+        # Handle next_t being -1 (end of chain)
+        if next_t[0] < 0:
+            alpha_bar_prev = th.tensor(1.0, device=self.device)
+        else:
+            alpha_bar_prev = _extract_into_tensor(self.alphas_cumprod, next_t, x.shape)
+            
+        sigma = (
+            eta
+            * th.sqrt((1 - alpha_bar_prev) / (1 - alpha_bar))
+            * th.sqrt(1 - alpha_bar / alpha_bar_prev)
+        )
+        
+        # 3. Equation for x_{t-1}
+        mean_pred = (
+            out["pred_xstart"] * th.sqrt(alpha_bar_prev)
+            + th.sqrt(1 - alpha_bar_prev - sigma ** 2) * eps
+        )
+        
+        noise = th.randn_like(x)
+        sample = mean_pred + sigma * noise
+        
+        return {"sample": sample, "pred_xstart": out["pred_xstart"]}
+
+    def ddim_sample_loop(self, model, shape, num_inference_steps=50, noise=None, clip_denoised=False, model_kwargs=None, progress=False, eta=0.0):
+        final = None
+        for sample in self.ddim_sample_loop_progressive(
+            model,
+            shape,
+            num_inference_steps=num_inference_steps,
+            noise=noise,
+            clip_denoised=clip_denoised,
+            model_kwargs=model_kwargs,
+            progress=progress,
+            eta=eta,
+        ):
+            final = sample
+        return final["sample"]
+
+    def ddim_sample_loop_progressive(self, model, shape, num_inference_steps=50, noise=None, clip_denoised=False, model_kwargs=None, progress=False, eta=0.0):
+        if noise is not None:
+            img = noise
+        else:
+            img = th.randn(*shape, device=self.device)
+            
+        # Create a subsequence of timesteps
+        step_ratio = self.num_timesteps // num_inference_steps
+        indices = list(range(0, self.num_timesteps, step_ratio))[::-1]
+        
+        # Ensure we have exactly num_inference_steps (sometimes integer division cuts one off)
+        # Or just use the stride logic.
+        
+        if progress:
+            from tqdm.auto import tqdm
+            indices = tqdm(indices)
+
+        for i, step in enumerate(indices):
+            t = th.tensor([step] * shape[0], device=self.device)
+            
+            # Determine next timestep
+            if i == len(indices) - 1:
+                next_step = -1
+            else:
+                next_step = indices[i + 1]
+                
+            next_t = th.tensor([next_step] * shape[0], device=self.device)
+            
+            with th.no_grad():
+                out = self.ddim_sample(
+                    model,
+                    img,
+                    t,
+                    next_t,
+                    eta=eta,
+                    clip_denoised=clip_denoised,
+                    model_kwargs=model_kwargs,
+                )
+                yield out
+                img = out["sample"]
 
     def _vb_terms_bpd(self, model, x_start, x_t, t, clip_denoised=False, model_kwargs=None):
         true_mean, _, true_log_variance_clipped = self.q_posterior_mean_variance(
