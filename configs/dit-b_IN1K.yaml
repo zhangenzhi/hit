@@ -5,6 +5,7 @@ data:
   # data_path: "/work/c30778/dataset/imagenet/"
   # data_path: "/work/c30778/imagenet_rc10_lat/"
   data_path: "/work/c30778/imagenet_cc_lat/"
+  # data_path: "/work/c30778/imagenet_norc_lat/"
   # data_path: "/work/c30778/imagenet_rc10_lat2/"
   image_size: 256
   num_workers: 32  # Latent 读取很快，可以适当增加 worker
