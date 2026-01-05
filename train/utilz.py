@@ -195,7 +195,7 @@ def save_checkpoint(trainer, epoch, avg_loss=None):
         checkpoint_path = os.path.join(trainer.config.results_dir, f"checkpoint_{epoch}.pt")
         checkpoint = {
             "model": trainer.model.module.state_dict() if trainer.config.use_ddp else trainer.model.state_dict(),
-            "ema": trainer.ema.shadow, 
+            # "ema": trainer.ema.shadow, 
             "optimizer": trainer.optimizer.state_dict(),
             "epoch": epoch,
             "config": trainer.config,
