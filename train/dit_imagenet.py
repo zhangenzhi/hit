@@ -117,7 +117,7 @@ class DiTImangenetTrainer:
             if viz_method == 'ddpm':
                 z = self.diffusion.sample_ddpm(
                     model=self.model,
-                    n=n_samples,
+                    # n=n_samples,
                     labels=labels,
                     size=size,
                     num_classes=self.num_classes,
@@ -129,7 +129,7 @@ class DiTImangenetTrainer:
             else:
                  z = self.diffusion.sample_ddim(
                     model=self.model, 
-                    n=n_samples, 
+                    # n=n_samples, 
                     labels=labels, 
                     size=size,
                     num_classes=self.num_classes,
@@ -203,7 +203,7 @@ class DiTImangenetTrainer:
                 if sample_method == 'ddpm':
                     z = self.diffusion.sample_ddpm(
                         model=self.model,
-                        n=n_samples,
+                        # n=n_samples,
                         labels=labels,
                         size=size,
                         num_classes=self.num_classes,
@@ -216,7 +216,7 @@ class DiTImangenetTrainer:
                     # Default fallback to DDIM
                     z = self.diffusion.sample_ddim(
                         model=self.model,
-                        n=n_samples,
+                        # n=n_samples,
                         labels=labels,
                         size=size,
                         num_classes=self.num_classes,
@@ -269,9 +269,9 @@ class DiTImangenetTrainer:
             
             t = torch.randint(0, self.diffusion.num_timesteps, (latents.shape[0],), device=self.device)
             
-            if self.label_dropout_prob > 0:
-                mask = torch.rand(labels.shape, device=self.device) < self.label_dropout_prob
-                labels = torch.where(mask, torch.tensor(self.num_classes, device=self.device), labels)
+            # if self.label_dropout_prob > 0:
+            #     mask = torch.rand(labels.shape, device=self.device) < self.label_dropout_prob
+            #     labels = torch.where(mask, torch.tensor(self.num_classes, device=self.device), labels)
 
             with torch.amp.autocast('cuda', dtype=self.dtype, enabled=self.use_amp):
                 loss_dict = self.diffusion.training_losses(self.model, latents, t, model_kwargs=dict(y=labels))
