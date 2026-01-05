@@ -112,10 +112,10 @@ def resume_checkpoint(trainer, checkpoint_path):
                     new_state_dict[k] = v
             trainer.model.load_state_dict(new_state_dict)
         
-    if "ema" in checkpoint:
-        trainer.ema.shadow = checkpoint["ema"]
-    else:
-        trainer.ema.register()
+    # if "ema" in checkpoint:
+    #     trainer.ema.shadow = checkpoint["ema"]
+    # else:
+    #     trainer.ema.register()
 
     if "optimizer" in checkpoint and trainer.optimizer is not None:
         trainer.optimizer.load_state_dict(checkpoint["optimizer"])
