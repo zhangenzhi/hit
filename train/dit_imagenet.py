@@ -117,7 +117,6 @@ class DiTImangenetTrainer:
             if viz_method == 'ddpm':
                 z = self.diffusion.sample_ddpm(
                     model=self.model,
-                    n=n_samples,
                     labels=labels,
                     size=size,
                     num_classes=self.num_classes,
@@ -129,7 +128,6 @@ class DiTImangenetTrainer:
             else:
                  z = self.diffusion.sample_ddim(
                     model=self.model, 
-                    n=n_samples, 
                     labels=labels, 
                     size=size,
                     num_classes=self.num_classes,
@@ -203,7 +201,6 @@ class DiTImangenetTrainer:
                 if sample_method == 'ddpm':
                     z = self.diffusion.sample_ddpm(
                         model=self.model,
-                        # n=n_samples,
                         labels=labels,
                         size=size,
                         num_classes=self.num_classes,
@@ -216,7 +213,6 @@ class DiTImangenetTrainer:
                     # Default fallback to DDIM
                     z = self.diffusion.sample_ddim(
                         model=self.model,
-                        # n=n_samples,
                         labels=labels,
                         size=size,
                         num_classes=self.num_classes,
