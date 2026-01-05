@@ -122,9 +122,61 @@ class GaussianDiffusion:
         if model_kwargs is None:
             model_kwargs = {}
 
-        B, C = x.shape[:2]
-        model_output = model(x, t, **model_kwargs)
+        # [Modified] Handle CFG arguments and cleanup kwargs so model() doesn't fail
+        model_kwargs = model_kwargs.copy()
+        cfg_scale = model_kwargs.pop("cfg_scale", 1.0)
+        num_classes = model_kwargs.pop("num_classes", None)
 
+        B, C = x.shape[:2]
+
+        # [Modified] Implement Classifier-Free Guidance logic
+        if cfg_scale != 1.0 and "y" in model_kwargs:
+            assert num_classes is not None, "num_classes must be provided for CFG"
+            
+            y = model_kwargs["y"]
+            # Create null labels (typically num_classes is the index for null token in DiT)
+            y_null = th.full_like(y, num_classes)
+            
+            # Prepare batched inputs: [conditional, unconditional]
+            x_in = th.cat([x, x], dim=0)
+            t_in = th.cat([t, t], dim=0)
+            y_in = th.cat([y, y_null], dim=0)
+            
+            # Update kwargs for the double batch
+            model_kwargs_cfg = model_kwargs.copy()
+            model_kwargs_cfg["y"] = y_in
+            
+            # Model forward pass with doubled batch
+            model_output = model(x_in, t_in, **model_kwargs_cfg)
+            
+            # Post-processing for CFG
+            if model_output.shape[1] == 2 * C:
+                # DiT output with learn_sigma: (2B, 2C, H, W)
+                # Split into [eps, var]
+                model_output, model_var_values = th.split(model_output, C, dim=1)
+                
+                # Split batch into [cond, uncond]
+                eps_cond, eps_uncond = th.split(model_output, B, dim=0)
+                var_cond, var_uncond = th.split(model_var_values, B, dim=0)
+                
+                # Apply guidance equation
+                model_output = eps_uncond + cfg_scale * (eps_cond - eps_uncond)
+                
+                # Use conditional variance (standard practice in GLIDE/DiT)
+                model_var_values = var_cond
+                
+                # Recombine to standard format for posterior calc
+                model_output = th.cat([model_output, model_var_values], dim=1)
+            else:
+                # Just eps (2B, C, H, W)
+                eps_cond, eps_uncond = th.split(model_output, B, dim=0)
+                model_output = eps_uncond + cfg_scale * (eps_cond - eps_uncond)
+        
+        else:
+            # Standard forward pass without CFG
+            model_output = model(x, t, **model_kwargs)
+
+        # Calculate mean and variance from model output
         if model_output.shape[1] == 2 * C:
             model_output, model_var_values = th.split(model_output, C, dim=1)
             min_log = _extract_into_tensor(self.posterior_log_variance_clipped, t, x.shape)
@@ -266,6 +318,7 @@ class GaussianDiffusion:
             model_kwargs = {}
         
         # 1. Get prediction of x_start and epsilon
+        # p_mean_variance will handle CFG internally now
         out = self.p_mean_variance(
             model,
             x,
