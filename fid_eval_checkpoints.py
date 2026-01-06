@@ -189,52 +189,44 @@ def main():
         if flat_config.local_rank == 0:
             print(f"\n>>> Processing Epoch {epoch} | Checkpoint: {ckpt_path}")
         
-        try:
-            # map_location 避免加载到 CPU 导致 OOM，或 GPU id 不匹配
-            checkpoint = torch.load(ckpt_path, map_location=trainer.device, weights_only=False)
-            
-            # [Key Logic] 优先加载 EMA 权重进行评估
-            # Trainer 中的 self.ema 被注释掉了，所以我们手动将 EMA 权重加载到 trainer.model 中
-            if "ema" in checkpoint:
-                if flat_config.local_rank == 0: print("Found EMA weights, using EMA for evaluation.")
-                state_dict = checkpoint["ema"]
-            else:
-                if flat_config.local_rank == 0: print("No EMA weights found, using standard model weights.")
-                state_dict = checkpoint["model"]
-            
-            # 处理 state_dict 的 key (移除 module. 前缀) 以适配 trainer.model
-            # Trainer 内部虽然包了 DDP，但 load_state_dict 最好对齐 key
-            clean_state_dict = remove_module_prefix(state_dict)
-            
-            # 如果 trainer.model 是 DDP 包装过的，它期望 key 有 module. 
-            # 或者我们可以直接加载到 trainer.model.module
-            if isinstance(trainer.model, torch.nn.parallel.DistributedDataParallel):
-                trainer.model.module.load_state_dict(clean_state_dict)
-            else:
-                trainer.model.load_state_dict(clean_state_dict)
+        # map_location 避免加载到 CPU 导致 OOM，或 GPU id 不匹配
+        checkpoint = torch.load(ckpt_path, map_location=trainer.device, weights_only=False)
+        
+        # [Key Logic] 优先加载 EMA 权重进行评估
+        # Trainer 中的 self.ema 被注释掉了，所以我们手动将 EMA 权重加载到 trainer.model 中
+        if "ema" in checkpoint:
+            if flat_config.local_rank == 0: print("Found EMA weights, using EMA for evaluation.")
+            state_dict = checkpoint["ema"]
+        else:
+            if flat_config.local_rank == 0: print("No EMA weights found, using standard model weights.")
+            state_dict = checkpoint["model"]
+        
+        # 处理 state_dict 的 key (移除 module. 前缀) 以适配 trainer.model
+        # Trainer 内部虽然包了 DDP，但 load_state_dict 最好对齐 key
+        clean_state_dict = remove_module_prefix(state_dict)
+        
+        # 如果 trainer.model 是 DDP 包装过的，它期望 key 有 module. 
+        # 或者我们可以直接加载到 trainer.model.module
+        if isinstance(trainer.model, torch.nn.parallel.DistributedDataParallel):
+            trainer.model.module.load_state_dict(clean_state_dict)
+        else:
+            trainer.model.load_state_dict(clean_state_dict)
 
-            # 运行评估
-            # evaluate_fid 已经修复了死锁问题
-            trainer.evaluate_fid(epoch, num_gen_batches=args.num_fid_batches)
-            
-            # 记录结果
-            if flat_config.local_rank == 0:
-                fid_log_path = os.path.join(args.checkpoint_dir, "fid_log.txt")
-                if os.path.exists(fid_log_path):
-                    with open(fid_log_path, 'r') as f:
-                        lines = f.readlines()
-                        last_line = lines[-1].strip() if lines else "No result"
-                    
-                    with open(log_file, 'a') as f:
-                        f.write(f"Checkpoint: {os.path.basename(ckpt_path)} | {last_line}\n")
-                    print(f"Recorded: {last_line}")
-
-        except Exception as e:
-            if flat_config.local_rank == 0:
-                print(f"Failed to evaluate {ckpt_path}: {e}")
-            import traceback
-            traceback.print_exc()
-            continue
+        # 运行评估
+        # evaluate_fid 已经修复了死锁问题
+        trainer.evaluate_fid(epoch, num_gen_batches=args.num_fid_batches)
+        
+        # 记录结果
+        if flat_config.local_rank == 0:
+            fid_log_path = os.path.join(args.checkpoint_dir, "fid_log.txt")
+            if os.path.exists(fid_log_path):
+                with open(fid_log_path, 'r') as f:
+                    lines = f.readlines()
+                    last_line = lines[-1].strip() if lines else "No result"
+                
+                with open(log_file, 'a') as f:
+                    f.write(f"Checkpoint: {os.path.basename(ckpt_path)} | {last_line}\n")
+                print(f"Recorded: {last_line}")
 
     cleanup()
 
