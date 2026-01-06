@@ -169,61 +169,54 @@ class DiTImangenetTrainer:
         loader_to_use = self.val_loader if self.val_loader is not None else self.loader
         loader_iter = iter(loader_to_use)
 
-        try:
-            # 1. Real Images
-            for i in range(num_gen_batches):
-                try:
-                    real_imgs, _ = next(loader_iter)
-                except StopIteration:
-                    loader_iter = iter(loader_to_use)
-                    real_imgs, _ = next(loader_iter)
-                    
-                real_imgs = real_imgs.to(self.device)
-                
-                if self.vae is not None and real_imgs.shape[1] == getattr(self.config, 'in_channels', 4):
-                     real_imgs = self.decode_image_or_latent(real_imgs)
-                else:
-                     real_imgs = (real_imgs.float() + 1.0) / 2.0
-                     real_imgs = real_imgs.clamp(0, 1)
+        # 1. Real Images
+        for i in range(num_gen_batches):
+            real_imgs, _ = next(loader_iter)    
+            real_imgs = real_imgs.to(self.device)
+            
+            if self.vae is not None and real_imgs.shape[1] == getattr(self.config, 'in_channels', 4):
+                    real_imgs = self.decode_image_or_latent(real_imgs)
+            else:
+                    real_imgs = (real_imgs.float() + 1.0) / 2.0
+                    real_imgs = real_imgs.clamp(0, 1)
 
-                real_imgs_uint8 = (real_imgs * 255.0).to(torch.uint8)
-                self.fid_metric.update(real_imgs_uint8, real=True)
+            real_imgs_uint8 = (real_imgs * 255.0).to(torch.uint8)
+            self.fid_metric.update(real_imgs_uint8, real=True)
+        
+        # 2. Fake Images
+        for i in range(num_gen_batches):
+            n_samples = self.config.batch_size
+            labels = torch.randint(0, self.num_classes, (n_samples,), device=self.device)
+            in_channels = getattr(self.config, 'in_channels', 4)
+            input_size = getattr(self.config, 'input_size', 32)
+            size = (in_channels, input_size, input_size)
             
-            # 2. Fake Images
-            for i in range(num_gen_batches):
-                n_samples = self.config.batch_size
-                labels = torch.randint(0, self.num_classes, (n_samples,), device=self.device)
-                in_channels = getattr(self.config, 'in_channels', 4)
-                input_size = getattr(self.config, 'input_size', 32)
-                size = (in_channels, input_size, input_size)
-                
-                # [Update] Force DDPM
-                z = self.diffusion.sample_ddpm(
-                    model=self.model,
-                    labels=labels,
-                    size=size,
-                    num_classes=self.num_classes,
-                    cfg_scale=4.0,
-                    use_amp=self.use_amp,
-                    dtype=self.dtype,
-                    is_latent=(self.vae is not None)
-                )
-                
-                fake_imgs = self.decode_image_or_latent(z)
-                
-                fake_imgs_uint8 = (fake_imgs * 255.0).to(torch.uint8)
-                self.fid_metric.update(fake_imgs_uint8, real=False)
+            # [Update] Force DDPM
+            z = self.diffusion.sample_ddpm(
+                model=self.model,
+                labels=labels,
+                size=size,
+                num_classes=self.num_classes,
+                cfg_scale=4.0,
+                use_amp=self.use_amp,
+                dtype=self.dtype,
+                is_latent=(self.vae is not None)
+            )
             
-            fid_score = self.fid_metric.compute()
+            fake_imgs = self.decode_image_or_latent(z)
             
-            if self.config.local_rank == 0:
-                print(f"[FID] Epoch {epoch} | FID Score: {fid_score.item():.4f} | Method: {sample_method.upper()}")
-                with open(os.path.join(self.config.results_dir, "fid_log.txt"), "a") as f:
-                    f.write(f"Epoch {epoch}, FID: {fid_score.item():.4f}, Method: {sample_method.upper()}\n")
-        finally:
-            # self.ema.restore()
-            self.model.train()
-            torch.cuda.empty_cache()
+            fake_imgs_uint8 = (fake_imgs * 255.0).to(torch.uint8)
+            self.fid_metric.update(fake_imgs_uint8, real=False)
+        
+        fid_score = self.fid_metric.compute()
+        
+        if self.config.local_rank == 0:
+            print(f"[FID] Epoch {epoch} | FID Score: {fid_score.item():.4f} | Method: {sample_method.upper()}")
+            with open(os.path.join(self.config.results_dir, "fid_log.txt"), "a") as f:
+                f.write(f"Epoch {epoch}, FID: {fid_score.item():.4f}, Method: {sample_method.upper()}\n")
+  
+        self.model.train()
+        torch.cuda.empty_cache()
 
 
     def train_one_epoch(self, epoch):
@@ -250,10 +243,6 @@ class DiTImangenetTrainer:
                     latents = images * 0.18215
             
             t = torch.randint(0, self.diffusion.num_timesteps, (latents.shape[0],), device=self.device)
-            
-            # if self.label_dropout_prob > 0:
-            #     mask = torch.rand(labels.shape, device=self.device) < self.label_dropout_prob
-            #     labels = torch.where(mask, torch.tensor(self.num_classes, device=self.device), labels)
 
             with torch.amp.autocast('cuda', dtype=self.dtype, enabled=self.use_amp):
                 loss_dict = self.diffusion.training_losses(self.model, latents, t, model_kwargs=dict(y=labels))
@@ -267,9 +256,6 @@ class DiTImangenetTrainer:
             
             self.scaler.step(self.optimizer)
             self.scaler.update()
-            
-            # if step % self.ema_update_every == 0:
-            #     self.ema.update()
             
             running_loss += loss.detach()
             log_steps += 1
@@ -289,8 +275,5 @@ class DiTImangenetTrainer:
             viz_interval = getattr(self.config, 'log_interval', 1)
             if epoch % viz_interval == 0:
                 self.visualize(epoch)
-            
-            # if epoch > 0 and epoch % 10 == 0:
-            #      self.evaluate_fid(epoch)
 
         return None
