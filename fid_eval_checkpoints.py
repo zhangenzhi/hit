@@ -66,18 +66,34 @@ def cleanup():
     if dist.is_initialized():
         dist.destroy_process_group()
 
+def decode_latents(latents, vae):
+    """
+    通用解码函数：将 Latent (B, 4, H, W) 解码为 RGB (B, 3, H*8, W*8)
+    """
+    # 1. 检查是否需要 scaling (SD VAE 默认 scale factor 是 0.18215)
+    # 训练时通常是 latents = encoder(x) * 0.18215
+    # 所以解码时要除以 0.18215
+    latents = latents.to(torch.float32) / 0.18215
+    
+    with torch.no_grad():
+        imgs = vae.decode(latents).sample
+    
+    # 2. 归一化 [-1, 1] -> [0, 1]
+    imgs = (imgs / 2 + 0.5).clamp(0, 1)
+    return imgs
+
 # -----------------------------------------------------------------------------
 # 核心逻辑
 # -----------------------------------------------------------------------------
 
-def prepare_real_statistics(loader, fid_metric, device, num_batches, rank):
+def prepare_real_statistics(loader, vae, fid_metric, device, num_batches, rank):
     """
-    预先计算真实图片的统计信息 (只需运行一次)
+    预先计算真实图片的统计信息
+    [Fix]: 如果 Loader 返回的是 4 通道 Latent，必须先用 VAE 解码成 3 通道 RGB
     """
     if rank == 0:
         print(f"--> Pre-calculating statistics for REAL images ({num_batches} batches)...")
     
-    # 确保不计算梯度
     with torch.no_grad():
         for i, (real_imgs, _) in enumerate(tqdm(loader, disable=(rank != 0), desc="Real Stats")):
             if i >= num_batches:
@@ -85,18 +101,29 @@ def prepare_real_statistics(loader, fid_metric, device, num_batches, rank):
             
             real_imgs = real_imgs.to(device)
             
-            # 假设 Loader 输出是 Latent，需要 VAE Decode 吗？
-            # 通常 FID 是在 Pixel 空间计算的。
-            # 如果 Loader 此时输出的是 Pixel (ImageNet Raw)，则归一化处理。
-            # 如果 Loader 输出的是 Latent，这里需要 decode。
-            # 为了通用性，这里假设 Loader 输出的是 Pixel [-1, 1] 或者 [0, 1]
-            # 请根据你的 Dataset 实际输出调整。
+            # [CRITICAL FIX] 检查通道数
+            if real_imgs.shape[1] == 4:
+                # 这是一个 Latent Tensor，需要解码
+                # 假设 loader 返回的数据已经被缩放过 (matches training distribution)
+                # 通常 DiT dataset loader 返回的是预先计算好的 latents
+                if vae is None:
+                    raise ValueError("Loader yields 4-channel latents but VAE is None. Cannot decode to RGB for FID.")
+                
+                # 显存保护：如果 batch 很大，VAE decode 可能会 OOM，这里直接解
+                real_imgs_rgb = decode_latents(real_imgs, vae)
             
-            # 假设: real_imgs 是 [-1, 1] 的 Pixel tensor
-            real_imgs = (real_imgs + 1.0) / 2.0  # -> [0, 1]
-            real_imgs = real_imgs.clamp(0, 1)
-            real_imgs_uint8 = (real_imgs * 255.0).to(torch.uint8)
-            
+            elif real_imgs.shape[1] == 3:
+                # 已经是 RGB 图片
+                if real_imgs.min() < 0: # 假设是 [-1, 1]
+                    real_imgs_rgb = (real_imgs + 1.0) / 2.0
+                else:
+                    real_imgs_rgb = real_imgs
+                real_imgs_rgb = real_imgs_rgb.clamp(0, 1)
+            else:
+                raise ValueError(f"Unexpected channel count: {real_imgs.shape[1]}")
+
+            # 转为 uint8 并 update FID
+            real_imgs_uint8 = (real_imgs_rgb * 255.0).to(torch.uint8)
             fid_metric.update(real_imgs_uint8, real=True)
     
     if rank == 0:
@@ -119,9 +146,12 @@ def evaluate_checkpoint(
         print(f"\n>>> Evaluating Epoch {epoch} | {os.path.basename(ckpt_path)}")
 
     # 1. 加载权重
-    # weights_only=False 是为了兼容旧版 PyTorch 保存习惯，新版建议 True 但可能报错
-    checkpoint = torch.load(ckpt_path, map_location='cpu', weights_only=False)
-    
+    try:
+        checkpoint = torch.load(ckpt_path, map_location='cpu', weights_only=False)
+    except Exception as e:
+        print(f"Failed to load {ckpt_path}: {e}")
+        return 0.0
+
     if "ema" in checkpoint:
         state_dict = checkpoint["ema"]
         if rank == 0: print("    Using EMA weights.")
@@ -131,76 +161,55 @@ def evaluate_checkpoint(
         
     state_dict = remove_module_prefix(state_dict)
     
-    # 2. 加载到模型 (In-place)
-    # 注意：这里不需要 unwrap_model，因为 model 本身就没有被 DDP 包裹
-    msg = model.load_state_dict(state_dict, strict=True)
-    # if rank == 0: print(f"    Load status: {msg}")
-    
+    # 2. 加载到模型
+    model.load_state_dict(state_dict, strict=True)
     model.eval()
     
     # 3. 生成过程
-    # 必须设置不同的种子，否则所有 Rank 生成一样的图
     seed = epoch * 100 + rank
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
     
-    total_gen = 0
-    
-    # FID metric 的 reset_real_features=False，所以调用 reset() 只会清空 fake 图片
+    # Reset fake stats only
     fid_metric.reset()
 
-    # 使用 tqdm 显示进度 (只在 Rank 0)
     pbar = tqdm(total=num_gen_batches, disable=(rank != 0), desc=f"Gen Epoch {epoch}")
     
     for _ in range(num_gen_batches):
-        n_samples = config.batch_size # 每个 GPU 的 batch size
+        n_samples = config.batch_size
         labels = torch.randint(0, config.num_classes, (n_samples,), device=device)
-        
-        # 构造输入形状
         size = (config.in_channels, config.input_size, config.input_size)
-        
-        # 采样 (直接调用 diffusion，传入裸模型)
-        # 强制使用 float32 或 bfloat16 进行采样，避免精度问题
         dtype = torch.bfloat16 if config.use_amp else torch.float32
         
         with torch.no_grad():
-            # 这里调用 sample_ddpm 或 sample_ddim
-            # 确保你的 diffusion.sample_xxx 支持传入 model
+            # Sample returns (B, 4, H, W) latents usually
             z = diffusion.sample_ddpm(
                 model=model,
                 labels=labels,
                 size=size,
                 num_classes=config.num_classes,
-                cfg_scale=4.0, # 标准 FID 配置通常是 1.5 - 4.0，需保持一致
+                cfg_scale=4.0, 
                 use_amp=config.use_amp,
                 dtype=dtype,
                 is_latent=(vae is not None)
             )
             
-            # 解码 (Latent -> Pixel)
+            # [CRITICAL FIX] Decode fake latents to RGB
             if vae is not None:
-                # VAE decode 最好用 float32 避免溢出
-                z = z.to(torch.float32) / 0.18215
-                x = vae.decode(z).sample
+                x_rgb = decode_latents(z, vae)
             else:
-                x = z
+                # Pixel diffusion
+                x_rgb = (z / 2 + 0.5).clamp(0, 1)
             
-            # 归一化并转 uint8
-            x = (x / 2 + 0.5).clamp(0, 1)
-            x_uint8 = (x * 255.0).to(torch.uint8)
-            
-            # 更新 Metric
+            x_uint8 = (x_rgb * 255.0).to(torch.uint8)
             fid_metric.update(x_uint8, real=False)
             
-        total_gen += n_samples
         pbar.update(1)
     
     pbar.close()
     
     # 4. 计算 FID
-    # torchmetrics 的 compute() 会自动处理跨进程同步 (AllGather)
-    # 注意：确保所有进程都执行到这里
-    if rank == 0: print("    Computing FID score (synchronizing across GPUs)...")
+    if rank == 0: print("    Computing FID score...")
     fid_score = fid_metric.compute()
     
     return fid_score.item()
@@ -210,7 +219,7 @@ def main():
     parser.add_argument("--config", type=str, default="./configs/dit-b_IN1K.yaml")
     parser.add_argument("--checkpoint_dir", type=str, required=True)
     parser.add_argument("--data_path", type=str, default=None)
-    parser.add_argument("--num_fid_batches", type=int, default=5, help="Total batches per GPU for FID (Rec: >=50)")
+    parser.add_argument("--num_fid_batches", type=int, default=50)
     parser.add_argument("--interval", type=int, default=20)
     parser.add_argument("--local-rank", type=int, default=-1)
     args = parser.parse_args()
@@ -240,23 +249,20 @@ def main():
     with open(args.config, "r") as f:
         config = dict_to_namespace(yaml.safe_load(f))
     
-    # 覆盖参数
     if args.data_path: config.data.data_path = args.data_path
-    
     flat_config = flatten_config(config)
     flat_config.local_rank = local_rank
-    flat_config.use_ddp = True # 虽然我们不用 DDP Wrapper，但数据加载可能需要知道
+    flat_config.use_ddp = True 
     
     # --- 3. 模型初始化 ---
     if rank == 0: print(f"Initializing models on {device}...")
     
-    # VAE
+    # VAE (必须加载！)
     vae = AutoencoderKL.from_pretrained("stabilityai/sd-vae-ft-mse").to(device)
     vae.eval()
     for p in vae.parameters(): p.requires_grad = False
     
-    # DiT (注意：这里不要用 DDP 包裹！只在 load_state_dict 时加载权重即可)
-    # 这样采样时每个卡跑自己的，没有通信开销
+    # DiT
     model = DiT(
         input_size=config.model.input_size,
         patch_size=config.model.patch_size,
@@ -268,9 +274,7 @@ def main():
         num_classes=config.model.num_classes,
         learn_sigma=getattr(config.model, 'learn_sigma', True)
     ).to(device)
-    model.eval() 
-    # 彻底禁用 compile 以避免加载权重时的动态重编译问题
-    # model = torch.compile(model) 
+    model.eval()
 
     # Diffusion
     diffusion = GaussianDiffusion(
@@ -281,39 +285,28 @@ def main():
         device=device
     )
 
-    # --- 4. FID Metric 初始化 ---
-    # feature=2048 是 FID 的标准
-    # reset_real_features=False 是核心：我们在循环外只算一次 Real Stats
+    # --- 4. FID Metric ---
     fid_metric = FrechetInceptionDistance(feature=2048, reset_real_features=False).to(device)
 
-    # --- 5. 数据加载 ---
+    # --- 5. Data Loader & Real Stats ---
     loaders = build_dit_dataloaders(flat_config)
-    # 如果验证集很大，我们不需要完整的 Loader，只需要能取够 num_fid_batches 即可
-    # 这里的 val_loader 需要支持 DistributedSampler，确保不同 Rank 读不同数据
-    val_loader = loaders['val']
-    if val_loader is None:
-        if rank == 0: print("Warning: No validation loader found. Using train loader for Real Stats.")
-        val_loader = loaders['train']
+    val_loader = loaders['val'] if loaders['val'] is not None else loaders['train']
 
-    # --- 6. 预计算 Real Stats (Golden Reference) ---
-    # 这一步只做一次！
-    prepare_real_statistics(val_loader, fid_metric, device, num_batches=args.num_fid_batches, rank=rank)
+    # [FIX] 传入 VAE 以便将 Latents 解码为 RGB
+    prepare_real_statistics(val_loader, vae, fid_metric, device, num_batches=args.num_fid_batches, rank=rank)
 
-    # --- 7. Checkpoint 扫描 ---
+    # --- 6. Eval Loop ---
     ckpt_files = glob.glob(os.path.join(args.checkpoint_dir, "checkpoint_*.pt"))
     ckpt_files.sort(key=lambda x: extract_epoch_from_filename(os.path.basename(x)))
     
-    # 过滤 Interval
     if args.interval > 1:
         ckpt_files = [f for f in ckpt_files if extract_epoch_from_filename(os.path.basename(f)) % args.interval == 0]
 
     if rank == 0:
-        print(f"Found {len(ckpt_files)} checkpoints to evaluate.")
-        log_file = os.path.join(args.checkpoint_dir, "fid_results_standalone.txt")
+        log_file = os.path.join(args.checkpoint_dir, "fid_results_fix.txt")
         if not os.path.exists(log_file):
             with open(log_file, "w") as f: f.write("Epoch, FID\n")
 
-    # --- 8. 循环评估 ---
     for ckpt_path in ckpt_files:
         try:
             score = evaluate_checkpoint(
@@ -327,8 +320,7 @@ def main():
                 with open(log_file, "a") as f:
                     f.write(f"{extract_epoch_from_filename(os.path.basename(ckpt_path))}, {score:.4f}\n")
         except Exception as e:
-            print(f"Error evaluating {ckpt_path}: {e}")
-            # 继续下一个，不要因为一个损坏的 checkpoint 停止
+            if rank == 0: print(f"Error evaluating {ckpt_path}: {e}")
             continue
             
     cleanup()
