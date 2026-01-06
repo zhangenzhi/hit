@@ -80,8 +80,8 @@ def main():
     parser.add_argument("--config", type=str, default="./configs/dit-b_IN1K.yaml", help="Path to config yaml")
     parser.add_argument("--checkpoint_dir", type=str, required=True, help="Directory containing checkpoint_*.pt files")
     parser.add_argument("--data_path", type=str, default=None, help="Override data path (if needed)")
-    parser.add_argument("--num_fid_batches", type=int, default=15, help="Number of batches for FID evaluation")
-    parser.add_argument("--interval", type=int, default=1, help="Interval for evaluating checkpoints")
+    parser.add_argument("--num_fid_batches", type=int, default=5, help="Number of batches for FID evaluation")
+    parser.add_argument("--interval", type=int, default=20, help="Interval for evaluating checkpoints")
     parser.add_argument("--local-rank", type=int, default=int(os.environ.get("LOCAL_RANK", 0)), help="Local rank for DDP")
     
     args = parser.parse_args()
