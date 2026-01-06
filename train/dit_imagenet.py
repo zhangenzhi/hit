@@ -220,6 +220,15 @@ class DiTImangenetTrainer:
 
 
     def train_one_epoch(self, epoch):
+        base_lr = getattr(self.config, 'lr', 1e-4)
+        current_lr = base_lr
+        if epoch >= 200:
+            current_lr = base_lr * 0.1
+        
+        # 将最新的 LR 应用到优化器中
+        for param_group in self.optimizer.param_groups:
+            param_group['lr'] = current_lr
+            
         self.model.train()
         if self.vae: self.vae.eval()
         
