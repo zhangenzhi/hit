@@ -146,7 +146,7 @@ class DiTImangenetTrainer:
             # self.ema.restore()
             self.model.train()
 
-    @torch.no_grad()
+     @torch.no_grad()
     def evaluate_fid(self, epoch, num_gen_batches=10):
         """
         FID 评估函数
@@ -156,8 +156,8 @@ class DiTImangenetTrainer:
         if self.config.use_ddp:
             dist.barrier()
         
-        # [Config] 获取采样方式，默认使用 DDPM (和 DiT 论文一致)
-        sample_method = getattr(self.config, 'sample_method', 'ddpm')
+        # [Config] 强制使用 DDPM (和 DiT 论文一致)
+        sample_method = 'ddpm'
         
         print(f"[FID] Starting evaluation for Epoch {epoch} using {sample_method.upper()} sampling...")
         # self.ema.apply_shadow()
@@ -197,31 +197,17 @@ class DiTImangenetTrainer:
                 input_size = getattr(self.config, 'input_size', 32)
                 size = (in_channels, input_size, input_size)
                 
-                # [Update] Support both DDPM and DDIM
-                if sample_method == 'ddpm':
-                    z = self.diffusion.sample_ddpm(
-                        model=self.model,
-                        labels=labels,
-                        size=size,
-                        num_classes=self.num_classes,
-                        cfg_scale=4.0,
-                        use_amp=self.use_amp,
-                        dtype=self.dtype,
-                        is_latent=(self.vae is not None)
-                    )
-                else:
-                    # Default fallback to DDIM
-                    z = self.diffusion.sample_ddim(
-                        model=self.model,
-                        labels=labels,
-                        size=size,
-                        num_classes=self.num_classes,
-                        num_inference_steps=50,
-                        cfg_scale=4.0,
-                        use_amp=self.use_amp,
-                        dtype=self.dtype,
-                        is_latent=(self.vae is not None)
-                    )
+                # [Update] Force DDPM
+                z = self.diffusion.sample_ddpm(
+                    model=self.model,
+                    labels=labels,
+                    size=size,
+                    num_classes=self.num_classes,
+                    cfg_scale=4.0,
+                    use_amp=self.use_amp,
+                    dtype=self.dtype,
+                    is_latent=(self.vae is not None)
+                )
                 
                 fake_imgs = self.decode_image_or_latent(z)
                 
@@ -229,6 +215,7 @@ class DiTImangenetTrainer:
                 self.fid_metric.update(fake_imgs_uint8, real=False)
             
             fid_score = self.fid_metric.compute()
+            
             if self.config.local_rank == 0:
                 print(f"[FID] Epoch {epoch} | FID Score: {fid_score.item():.4f} | Method: {sample_method.upper()}")
                 with open(os.path.join(self.config.results_dir, "fid_log.txt"), "a") as f:
@@ -237,8 +224,7 @@ class DiTImangenetTrainer:
             # self.ema.restore()
             self.model.train()
             torch.cuda.empty_cache()
-        if self.config.use_ddp:
-            dist.barrier()
+
 
     def train_one_epoch(self, epoch):
         self.model.train()

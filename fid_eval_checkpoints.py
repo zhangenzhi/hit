@@ -8,18 +8,31 @@ import torch
 import torch.distributed as dist
 from diffusers.models import AutoencoderKL
 from types import SimpleNamespace
+from collections import OrderedDict
 
 # -----------------------------------------------------------------------------
-# 路径设置
+# 路径设置 (根据实际环境调整)
 # -----------------------------------------------------------------------------
 current_dir = os.path.dirname(os.path.abspath(__file__))
 root_dir = os.path.dirname(current_dir)
 sys.path.append(root_dir)
 
-from model.dit import DiT
-from diffusion.gaussian_diffusion import GaussianDiffusion
-from train.dit_imagenet import DiTImangenetTrainer
-from dataset.dit_latent_imagenet import build_dit_dataloaders
+# 假设用户的目录结构如下
+# ./model/dit.py
+# ./diffusion/gaussian_diffusion.py
+# ./train/dit_imagenet.py
+# ./dataset/dit_latent_imagenet.py
+
+try:
+    from model.dit import DiT
+    from diffusion.gaussian_diffusion import GaussianDiffusion
+    from train.dit_imagenet import DiTImangenetTrainer
+    from dataset.dit_latent_imagenet import build_dit_dataloaders
+except ImportError as e:
+    print(f"Import Error: {e}")
+    print("Please ensure your python path includes the project root and the file structure is correct.")
+    # Fallback/Debug imports if running in a flat structure (optional)
+    # from dit_imagenet import DiTImangenetTrainer
 
 def dict_to_namespace(d):
     x = SimpleNamespace()
@@ -50,6 +63,16 @@ def extract_epoch_from_filename(filename):
     match = re.search(r'checkpoint_(\d+).pt', filename)
     return int(match.group(1)) if match else -1
 
+def remove_module_prefix(state_dict):
+    """
+    移除 DDP 保存时产生的 'module.' 前缀
+    """
+    new_state_dict = OrderedDict()
+    for k, v in state_dict.items():
+        name = k[7:] if k.startswith('module.') else k
+        new_state_dict[name] = v
+    return new_state_dict
+
 def main():
     parser = argparse.ArgumentParser(description="Evaluate FID for a sequence of DiT checkpoints")
     parser.add_argument("--config", type=str, default="./configs/dit-b_IN1K.yaml", help="Path to config yaml")
@@ -62,6 +85,10 @@ def main():
     args = parser.parse_args()
 
     # 1. 加载配置
+    if not os.path.exists(args.config):
+        print(f"Config file not found: {args.config}")
+        return
+
     with open(args.config, "r") as f:
         config_dict = yaml.safe_load(f)
     config = dict_to_namespace(config_dict)
@@ -100,22 +127,20 @@ def main():
     # 按 epoch 从小到大排序
     ckpt_files.sort(key=lambda x: extract_epoch_from_filename(os.path.basename(x)))
     
-    # [Modify] 过滤 Checkpoints：只保留符合间隔的
+    # [Modify] 过滤 Checkpoints
     if args.interval > 1:
         ckpt_files = [f for f in ckpt_files if extract_epoch_from_filename(os.path.basename(f)) % args.interval == 0]
-        # 也可以强制保留最后一个 checkpoint，防止刚好错过
-        # if len(ckpt_files) == 0 or extract_epoch_from_filename(os.path.basename(ckpt_files[-1])) != extract_epoch_from_filename(os.path.basename(glob.glob(os.path.join(args.checkpoint_dir, "checkpoint_*.pt"))[-1])):
-        #     # Optional logic to include the very last one
-        #     pass
 
     if len(ckpt_files) == 0:
         if flat_config.local_rank == 0:
             print(f"No checkpoints found matching interval {args.interval}!")
         return
 
-    # 4. 构建 DataLoaders (重点：获取 val_loader)
+    # 4. 构建 DataLoaders
+    # flat_config 需要包含 batch_size, num_workers 等信息，通常在 yaml 的 data 部分
+    # 这里的 flat_config 是 flatten 后的，确保 key 存在
     loaders = build_dit_dataloaders(flat_config)
-    train_loader = loaders['train'] # Trainer 初始化需要，虽然我们不用它
+    train_loader = loaders['train'] 
     val_loader = loaders['val']
     
     if val_loader is None and flat_config.local_rank == 0:
@@ -128,6 +153,10 @@ def main():
         param.requires_grad = False
     
     if flat_config.local_rank == 0: print("Initializing DiT Model...")
+    
+    # 获取 learn_sigma 配置，默认为 True
+    learn_sigma = getattr(config.model, 'learn_sigma', True)
+    
     model = DiT(
         input_size=config.model.input_size,
         patch_size=config.model.patch_size,
@@ -135,15 +164,16 @@ def main():
         hidden_size=config.model.hidden_size,
         depth=config.model.depth,
         num_heads=config.model.num_heads,
-        class_dropout_prob=0.1,
-        num_classes=config.model.num_classes
+        class_dropout_prob=0.1, # 评估时此参数不影响 inference
+        num_classes=config.model.num_classes,
+        learn_sigma=learn_sigma
     )
     
     diffusion = GaussianDiffusion(
         num_timesteps=config.diffusion.num_timesteps,
         beta_start=config.diffusion.beta_start,
         beta_end=config.diffusion.beta_end,
-        schedule="cosine",
+        schedule="cosine", # 确保与训练时一致
         device=f"cuda:{args.local_rank}"
     )
     
@@ -159,47 +189,54 @@ def main():
         if flat_config.local_rank == 0:
             print(f"\n>>> Processing Epoch {epoch} | Checkpoint: {ckpt_path}")
         
-        # 手动加载 Checkpoint (跳过 Optimizer 以加速)
         try:
+            # map_location 避免加载到 CPU 导致 OOM，或 GPU id 不匹配
             checkpoint = torch.load(ckpt_path, map_location=trainer.device, weights_only=False)
             
-            # 加载模型权重 (处理 DDP 前缀)
-            state_dict = checkpoint["model"]
-            if trainer.config.use_ddp:
-                trainer.model.module.load_state_dict(state_dict)
-            else:
-                trainer.model.load_state_dict(state_dict)
-                
-            # 加载 EMA 权重 (关键！FID 评估必须用 EMA)
+            # [Key Logic] 优先加载 EMA 权重进行评估
+            # Trainer 中的 self.ema 被注释掉了，所以我们手动将 EMA 权重加载到 trainer.model 中
             if "ema" in checkpoint:
-                trainer.ema.shadow = checkpoint["ema"]
-                if flat_config.local_rank == 0: print("EMA state loaded.")
+                if flat_config.local_rank == 0: print("Found EMA weights, using EMA for evaluation.")
+                state_dict = checkpoint["ema"]
             else:
-                if flat_config.local_rank == 0: print("Warning: No EMA in checkpoint!")
+                if flat_config.local_rank == 0: print("No EMA weights found, using standard model weights.")
+                state_dict = checkpoint["model"]
+            
+            # 处理 state_dict 的 key (移除 module. 前缀) 以适配 trainer.model
+            # Trainer 内部虽然包了 DDP，但 load_state_dict 最好对齐 key
+            clean_state_dict = remove_module_prefix(state_dict)
+            
+            # 如果 trainer.model 是 DDP 包装过的，它期望 key 有 module. 
+            # 或者我们可以直接加载到 trainer.model.module
+            if isinstance(trainer.model, torch.nn.parallel.DistributedDataParallel):
+                trainer.model.module.load_state_dict(clean_state_dict)
+            else:
+                trainer.model.load_state_dict(clean_state_dict)
 
             # 运行评估
-            # evaluate_fid 内部会自动使用 self.ema.apply_shadow()
+            # evaluate_fid 已经修复了死锁问题
             trainer.evaluate_fid(epoch, num_gen_batches=args.num_fid_batches)
             
-            # 读取刚才 trainer 写入的 fid_log.txt 的最后一行，转存到汇总表
+            # 记录结果
             if flat_config.local_rank == 0:
                 fid_log_path = os.path.join(args.checkpoint_dir, "fid_log.txt")
                 if os.path.exists(fid_log_path):
                     with open(fid_log_path, 'r') as f:
                         lines = f.readlines()
-                        last_line = lines[-1].strip()
+                        last_line = lines[-1].strip() if lines else "No result"
                     
                     with open(log_file, 'a') as f:
                         f.write(f"Checkpoint: {os.path.basename(ckpt_path)} | {last_line}\n")
                     print(f"Recorded: {last_line}")
 
         except Exception as e:
-            print(f"Failed to evaluate {ckpt_path}: {e}")
+            if flat_config.local_rank == 0:
+                print(f"Failed to evaluate {ckpt_path}: {e}")
+            import traceback
+            traceback.print_exc()
             continue
 
     cleanup()
 
 if __name__ == "__main__":
     main()
-    
-# torchrun --nproc_per_node=4 fid_eval_checkpoints.py --checkpoint_dir ./results/dit_b_2_latent-v7 --interval 10
