@@ -146,7 +146,7 @@ class DiTImangenetTrainer:
             # self.ema.restore()
             self.model.train()
 
-     @torch.no_grad()
+    @torch.no_grad()
     def evaluate_fid(self, epoch, num_gen_batches=10):
         """
         FID 评估函数
